@@ -150,6 +150,13 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | --- | --- | --- |
 | `moodle course announcements` | `get_course_announcements` | List a course's news-forum posts. |
 
+### [Calendar](docs/calendar.md)
+
+| CLI | MCP tool | Description |
+| --- | --- | --- |
+| `moodle courses calendar` | `get_calendar` | Show what is due across every enrolled course. |
+| `moodle course calendar` | `get_calendar` | Show what is due in one course. |
+
 ### [Assignments](docs/assignments.md)
 
 | CLI | MCP tool | Description |

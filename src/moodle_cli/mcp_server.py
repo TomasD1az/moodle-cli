@@ -12,6 +12,7 @@ Two rules shape every signature here:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -337,6 +338,68 @@ def get_course_announcements(course: str | None = None) -> list[dict[str, Any]]:
             "pinned": a.pinned,
         }
         for a in announcements
+    ]
+
+
+@mcp.tool()
+def get_calendar(
+    course: str | None = None,
+    days: int = 14,
+    overdue: bool = False,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """What is due, across every enrolled course or within one.
+
+    This is the cheapest and broadest deadline view available: one call covers the whole
+    campus and every activity type, where get_assignments and get_quizzes each cover one.
+    Prefer it for "what do I have this week"; use the other two when you need
+    assignment- or quiz-specific fields such as submission status or attempt counts.
+
+    `days` bounds the window and `overdue` flips it: false covers the next `days` days,
+    true covers the `days` days just past, which is where an already-missed deadline is.
+    Both ends are bounded on purpose, so a year-out final exam does not crowd out this
+    week.
+
+    Only activities that publish a deadline to the calendar appear here. A due date a
+    teacher wrote into a page or an announcement does not, so treat this as the floor of
+    what is owed rather than the complete list.
+
+    `due_at` is a full timestamp carrying its UTC offset, because a deadline is a moment
+    and not a day — the same reason it is one in get_assignments.
+
+    `instance_id` is the activity's own id, which is what get_assignment_status and
+    get_quiz_status take; `activity` says which of the two applies.
+    """
+    now = int(time.time())
+    span = days * 86_400
+    since, until = (now - span, now) if overdue else (now, now + span)
+
+    client = open_client()
+    with client:
+        if course:
+            resolved = client.resolve_course(course)
+            course_names = {resolved.id: resolved.shortname}
+            events = client.get_calendar_events(
+                course_id=resolved.id, since=since, until=until, limit=limit
+            )
+        else:
+            events = client.get_calendar_events(since=since, until=until, limit=limit)
+            course_names = _course_names(client) if events else {}
+
+    return [
+        {
+            "id": e.id,
+            "name": e.name,
+            "course": course_names.get(e.course_id, str(e.course_id)),
+            "activity": e.modulename or None,
+            "instance_id": e.instance or None,
+            "due_at": e.sorts_at.isoformat() if e.sorts_at else None,
+            "overdue": e.overdue,
+            "action": e.action_name or None,
+            "actionable": e.actionable,
+            "url": e.url or e.viewurl or None,
+        }
+        for e in events
     ]
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import textwrap
+import time
 from collections.abc import Callable, Iterable, Sequence
 from enum import StrEnum
 from pathlib import Path
@@ -37,6 +38,7 @@ from moodle_cli.errors import MoodleError
 from moodle_cli.models import (
     Announcement,
     Assignment,
+    CalendarEvent,
     Participant,
     Section,
     epoch_to_datetime,
@@ -154,6 +156,16 @@ def _format_epoch(value: int, fmt: str = "%Y-%m-%d") -> str:
 
 def _plural(count: int, noun: str) -> str:
     return noun if count == 1 else f"{noun}s"
+
+
+def _format_moment(value: int) -> str:
+    """Render a timestamp to the minute, for a deadline rather than a date.
+
+    Every other table here prints a bare date, which is the right granularity to scan a
+    list of activities. A calendar is the one place where the hour is the whole point: a
+    quiz closing at 23:59 and one closing at 09:00 on the same day are not the same row.
+    """
+    return _format_epoch(value, "%Y-%m-%d %H:%M")
 
 
 def _format_year(value: int) -> str:
@@ -326,6 +338,115 @@ def courses_assignments(as_json: JsonOpt = False) -> None:
             _grade_cell(a),
         )
     console.print(table)
+
+
+DaysOpt = Annotated[
+    int, typer.Option("--days", min=1, help="How many days of the window to cover.")
+]
+OverdueOpt = Annotated[
+    bool,
+    typer.Option(
+        "--overdue", help="Show the window that has already passed instead of the one ahead."
+    ),
+]
+LimitOpt = Annotated[int, typer.Option("--limit", min=1, help="Maximum events to return.")]
+
+
+def _window_label(days: int, overdue: bool) -> str:
+    """The window in words, named once so both calendar commands phrase it the same."""
+    return f"{'past' if overdue else 'next'} {days} {_plural(days, 'day')}"
+
+
+def _event_window(days: int, overdue: bool) -> tuple[int, int]:
+    """The (since, until) epoch bounds a calendar request covers.
+
+    Both directions are bounded. An unbounded past would reach back to whatever the
+    campus has ever recorded, and an unbounded future returns next year's exam alongside
+    tomorrow's problem set, which is not what "what is due" means to anyone.
+    """
+    now = int(time.time())
+    span = days * 86_400
+    return (now - span, now) if overdue else (now, now + span)
+
+
+def _event_payload(event: CalendarEvent, course: str) -> dict[str, Any]:
+    """One event, with the instant carrying its offset and the course named, not numbered."""
+    return {
+        "id": event.id,
+        "name": event.name,
+        "course": course,
+        "activity": event.modulename,
+        "instance_id": event.instance,
+        "due_at": event.sorts_at.isoformat() if event.sorts_at else None,
+        "overdue": event.overdue,
+        "action": event.action_name,
+        "actionable": event.actionable,
+        "url": event.url or event.viewurl,
+    }
+
+
+def _print_events(events: list[CalendarEvent], course_names: dict[int, str], title: str) -> None:
+    """Render events in the calendar's own order, marking the ones already past.
+
+    Only `what` flexes; the rest are fixed and no-wrap, so a narrow terminal ellipsizes
+    the activity name rather than crushing the deadline that identifies the row. The
+    event's action ("Add submission", "Attempt quiz now") is left to --json: it is the
+    longest field by far, `type` already says which activity it belongs to, and keeping
+    it would take the width away from the name.
+    """
+    table = Table(title=title, expand=True)
+    table.add_column("due", justify="left", no_wrap=True)
+    table.add_column("course", no_wrap=True)
+    table.add_column("what", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("type", no_wrap=True, style="dim")
+    for event in events:
+        due = _format_moment(event.timesort)
+        table.add_row(
+            f"[red]{due}[/red]" if event.overdue else due,
+            escape(course_names.get(event.course_id, "-")),
+            escape(event.name),
+            escape(event.modulename or "-"),
+        )
+    console.print(table)
+
+
+@courses_app.command("calendar")
+@handle_errors
+def courses_calendar(
+    days: DaysOpt = 14,
+    overdue: OverdueOpt = False,
+    limit: LimitOpt = 200,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what is due across every enrolled course.
+
+    One call answers for the whole campus, so this is the cheapest view of a week there
+    is — cheaper than listing assignments and quizzes separately, and it covers every
+    activity type rather than those two.
+
+    Only activities that publish a deadline to the calendar appear. A due date a teacher
+    wrote into a page or an announcement is not one of them, so this is the floor of what
+    you owe, not the ceiling.
+
+    Times are printed to the minute, because a deadline is an instant: see "Deadlines are
+    moments" in the README.
+    """
+    since, until = _event_window(days, overdue)
+    with open_client() as client:
+        events = client.get_calendar_events(since=since, until=until, limit=limit)
+        course_names = _course_names(client) if events else {}
+
+    if as_json:
+        _emit_json(
+            [_event_payload(e, course_names.get(e.course_id, str(e.course_id))) for e in events]
+        )
+        return
+
+    window = _window_label(days, overdue)
+    if not events:
+        console.print(f"Nothing due in the {window}.")
+        return
+    _print_events(events, course_names, f"{len(events)} due, {window}")
 
 
 def _by_due_date(assignment: Assignment) -> tuple[bool, int]:
@@ -768,6 +889,41 @@ def _announcement_payload(announcement: Announcement, course: str) -> dict[str, 
         "replies": announcement.numreplies,
         "pinned": announcement.pinned,
     }
+
+
+@course_app.command("calendar")
+@handle_errors
+def course_calendar(
+    course: CourseArg,
+    days: DaysOpt = 14,
+    overdue: OverdueOpt = False,
+    limit: LimitOpt = 200,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what is due in one course.
+
+    The same view as `courses calendar`, narrowed server-side rather than by filtering a
+    campus-wide answer, so a course with a busy week is not crowded out of the limit by
+    the rest of your enrolment.
+    """
+    since, until = _event_window(days, overdue)
+    with open_client() as client:
+        found = client.resolve_course(course)
+        events = client.get_calendar_events(
+            course_id=found.id, since=since, until=until, limit=limit
+        )
+
+    if as_json:
+        _emit_json([_event_payload(e, found.shortname) for e in events])
+        return
+
+    window = _window_label(days, overdue)
+    if not events:
+        console.print(f"Nothing due in {found.shortname} in the {window}.")
+        return
+    _print_events(
+        events, {found.id: found.shortname}, f"{found.shortname}: {len(events)} due, {window}"
+    )
 
 
 @course_app.command("assignments")

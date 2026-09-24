@@ -21,6 +21,7 @@ from moodle_cli.errors import MoodleAPIError
 from moodle_cli.mcp_server import (
     get_assignment_status,
     get_assignments,
+    get_calendar,
     get_course_announcements,
     get_course_contents,
     get_grade_summary,
@@ -584,3 +585,83 @@ def test_get_grades_surfaces_the_permission_error_instead_of_hiding_it(
 
     with pytest.raises(MoodleAPIError, match="nopermissiontoviewgrades"):
         get_grades("IOS460")
+
+
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_calendar_names_courses_and_keeps_the_offset(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    results = get_calendar()
+
+    assert results[0] == {
+        "id": 990117,
+        "name": "Actividad semana 2 se cierra",
+        "course": "IOS460 - 123246",
+        "activity": "quiz",
+        "instance_id": 42628,
+        "due_at": _local_iso(1773954000),
+        "overdue": False,
+        "action": "Intente resolver el cuestionario ahora",
+        "actionable": True,
+        "url": "https://campus.example.edu/mod/quiz/view.php?id=866948",
+    }
+
+
+@respx.mock
+def test_get_calendar_reports_a_site_event_as_belonging_to_no_activity(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """Null course, modulename and action become null, not "0" and not "" ."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    site_event = next(e for e in get_calendar() if e["id"] == 990119)
+
+    assert site_event["activity"] is None
+    assert site_event["instance_id"] is None
+    assert site_event["action"] is None
+    assert site_event["actionable"] is False
+    assert site_event["course"] == "0"
+
+
+@respx.mock
+def test_get_calendar_narrows_one_course_server_side(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_calendar_get_action_events_by_course=calendar_payload,
+    )
+
+    get_calendar("IOS460")
+
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert any("core_calendar_get_action_events_by_course" in body for body in bodies)
+    assert not any("core_calendar_get_action_events_by_timesort" in body for body in bodies)
+
+
+@respx.mock
+def test_get_calendar_overdue_looks_backwards(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """Overdue is the same query with the window flipped, not a filter on the result."""
+    route = route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    get_calendar(overdue=True, days=7)
+
+    body = route.calls[0].request.content.decode()
+    params = dict(pair.split("=", 1) for pair in body.split("&") if "=" in pair)
+    assert int(params["timesortto"]) - int(params["timesortfrom"]) == 7 * 86_400

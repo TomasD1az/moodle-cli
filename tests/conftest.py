@@ -185,6 +185,18 @@ def grade_items_payload() -> dict[str, Any]:
 
 
 @pytest.fixture
+def calendar_payload() -> dict[str, Any]:
+    """Three action events: a quiz closing, an overdue assignment, and a site event.
+
+    The site event is the awkward one and the reason it is here: it arrives with a null
+    ``course``, ``modulename`` and ``action``, so anything that reads those without
+    allowing for absence breaks on it rather than on the two ordinary rows.
+    """
+    payload: dict[str, Any] = load_fixture("calendar_events.json")
+    return payload
+
+
+@pytest.fixture
 def site_info_payload() -> dict[str, Any]:
     return {"userid": 63643, "functions": []}
 

@@ -9,6 +9,7 @@ Requires MOODLE_URL plus either a stored token, MOODLE_TOKEN, or MOODLE_USER/MOO
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import httpx
@@ -165,3 +166,39 @@ def test_get_grade_items_either_succeeds_or_reports_the_known_permission_error(
             assert all(item.label for item in items)
         return
     pytest.skip("no course grade overview to test against")
+
+
+def test_calendar_returns_events_for_a_bounded_window(live_client: MoodleClient) -> None:
+    """The calendar endpoints must stay exposed and keep their paging contract.
+
+    A window a year wide either side, because a quiet fortnight is normal and an empty
+    answer would prove nothing about whether the endpoint still works.
+    """
+    now = int(time.time())
+    year = 365 * 86_400
+    events = live_client.get_calendar_events(since=now - year, until=now + year, limit=60)
+    if not events:
+        pytest.skip("no calendar events in the past or coming year")
+
+    assert all(event.id > 0 for event in events)
+    assert all(event.timesort > 0 for event in events)
+    # timesort is what the calendar orders by, and paging depends on that order holding.
+    assert [e.timesort for e in events] == sorted(e.timesort for e in events)
+
+
+def test_calendar_by_course_is_a_subset_of_the_campus_sweep(live_client: MoodleClient) -> None:
+    """The two functions must agree, or narrowing by course would hide events."""
+    now = int(time.time())
+    year = 365 * 86_400
+    everything = live_client.get_calendar_events(since=now - year, until=now + year, limit=200)
+    with_a_course = [e for e in everything if e.course_id]
+    if not with_a_course:
+        pytest.skip("no course-bound calendar events to compare")
+
+    course_id = with_a_course[0].course_id
+    one_course = live_client.get_calendar_events(
+        course_id=course_id, since=now - year, until=now + year, limit=200
+    )
+
+    assert {e.id for e in one_course} <= {e.id for e in everything}
+    assert all(e.course_id == course_id for e in one_course)

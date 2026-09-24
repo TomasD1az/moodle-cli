@@ -626,6 +626,125 @@ def test_resolve_course_reports_unknown_id(resolving_client: MoodleClient) -> No
         resolving_client.resolve_course("4242")
 
 
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_calendar_events_defaults_to_upcoming(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """No `since` means "from now", which is what makes the default answer upcoming."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    events = client.get_calendar_events(limit=3)
+
+    assert [e.id for e in events] == [990117, 990118, 990119]
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_calendar_get_action_events_by_timesort"
+    assert int(params["timesortfrom"]) > 0
+    assert "courseid" not in params
+
+
+@respx.mock
+def test_get_calendar_events_switches_function_for_one_course(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """A course is narrowed server-side, not by filtering a campus-wide answer."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    client.get_calendar_events(course_id=101, limit=3)
+
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_calendar_get_action_events_by_course"
+    assert params["courseid"] == "101"
+
+
+@respx.mock
+def test_get_calendar_events_reads_a_site_event_with_no_course(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """A null course, modulename and action must not raise; they mean "none"."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    site_event = next(e for e in client.get_calendar_events(limit=3) if e.id == 990119)
+
+    assert site_event.course is None
+    assert site_event.course_id == 0
+    assert site_event.modulename == ""
+    assert site_event.action_name == ""
+    assert site_event.actionable is False
+
+
+@respx.mock
+def test_get_calendar_events_pages_until_a_short_page(
+    client: MoodleClient, calendar_payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moodle's cursor is the last event id seen, not an offset.
+
+    The page size is shrunk rather than the fixture grown: what is under test is that a
+    full page triggers another request and a short one ends the loop, and that reads the
+    same at two per page as at fifty.
+    """
+    monkeypatch.setattr("moodle_cli.client._CALENDAR_PAGE_SIZE", 2)
+    first = {"events": calendar_payload["events"][:2], "lastid": 990118}
+    second = {"events": calendar_payload["events"][2:], "lastid": 990119}
+    route = respx.post(REST_URL).mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=second)]
+    )
+
+    events = client.get_calendar_events(limit=10)
+
+    assert [e.id for e in events] == [990117, 990118, 990119]
+    assert len(route.calls) == 2
+    assert "aftereventid" not in posted_params(route.calls[0].request)
+    assert posted_params(route.calls[1].request)["aftereventid"] == "990118"
+
+
+@respx.mock
+def test_get_calendar_events_falls_back_to_the_last_event_id(
+    client: MoodleClient, calendar_payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response without `lastid` must still advance, or the loop repeats one page."""
+    monkeypatch.setattr("moodle_cli.client._CALENDAR_PAGE_SIZE", 2)
+    first = {"events": calendar_payload["events"][:2]}
+    second = {"events": calendar_payload["events"][2:]}
+    route = respx.post(REST_URL).mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=second)]
+    )
+
+    client.get_calendar_events(limit=10)
+
+    assert posted_params(route.calls[1].request)["aftereventid"] == "990118"
+
+
+@respx.mock
+def test_get_calendar_events_stops_at_the_limit(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """The limit is a cap on what is fetched, not a filter applied afterwards."""
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json={"events": calendar_payload["events"][:1]})
+    )
+
+    client.get_calendar_events(limit=1)
+
+    assert len(route.calls) == 1
+    assert posted_params(route.calls[0].request)["limitnum"] == "1"
+
+
+@respx.mock
+def test_get_calendar_events_sends_an_upper_bound_only_when_given(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    client.get_calendar_events(since=1_700_000_000, until=1_800_000_000, limit=3)
+
+    params = posted_params(route.calls[0].request)
+    assert params["timesortfrom"] == "1700000000"
+    assert params["timesortto"] == "1800000000"
+
+
 # -- caching ---------------------------------------------------------------------
 
 

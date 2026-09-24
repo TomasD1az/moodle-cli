@@ -322,6 +322,92 @@ class QuizStatus(_Base):
     max_grade: float | None = None
 
 
+class EventAction(_Base):
+    """What a calendar event is asking you to do, and whether it is still open.
+
+    ``actionable`` is Moodle's own answer to "can this be acted on right now": a quiz
+    outside its window and an assignment past its cutoff both still carry an action, and
+    only this flag tells them apart from one you can still act on.
+    """
+
+    name: _Text = ""
+    url: _Text = ""
+    itemcount: int = 0
+    actionable: bool = False
+
+
+class EventCourse(_Base):
+    """The course an event belongs to, as the calendar endpoints nest it.
+
+    A site-level event carries no course at all, which is why the parent field is
+    nullable rather than defaulted: "no course" and "course 0" are different answers.
+    """
+
+    id: int = 0
+    shortname: _Text = ""
+    fullname: _Text = ""
+
+
+class CalendarEvent(_Base):
+    """A dated, actionable item: an assignment due, a quiz closing, a chat starting.
+
+    These are *action* events, not the whole calendar. Moodle builds them per activity
+    module, so an event exists only where a module chose to publish one — which is what
+    makes this the one endpoint that answers "what is due" across every course at once,
+    and also why a deadline a teacher wrote into a page rather than into a due date will
+    never appear here.
+
+    ``timesort`` is the field to order by, not ``timestart``: for an event with a
+    duration the two differ, and the calendar's own ordering is by ``timesort``.
+    """
+
+    id: int
+    name: _Text = ""
+    description: _Text = ""
+    eventtype: _Text = ""
+    #: The activity type, e.g. ``assign`` or ``quiz``. Empty for a non-module event.
+    modulename: _Text = ""
+    #: The activity instance id, which is what the per-activity endpoints take.
+    instance: int = 0
+    timestart: _Epoch = 0
+    timesort: _Epoch = 0
+    timeduration: _Epoch = 0
+    overdue: bool = False
+    url: _Text = ""
+    viewurl: _Text = ""
+    course: EventCourse | None = None
+    action: EventAction | None = None
+
+    @property
+    def starts_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timestart)
+
+    @property
+    def sorts_at(self) -> datetime | None:
+        """The instant the calendar orders this event by; the deadline, for a deadline."""
+        return epoch_to_datetime(self.timesort)
+
+    @property
+    def description_text(self) -> str:
+        """``description`` as plain text; the calendar stores it as HTML."""
+        return html_to_text(self.description)
+
+    @property
+    def course_id(self) -> int:
+        """0 for a site-level event, which belongs to no course."""
+        return self.course.id if self.course else 0
+
+    @property
+    def action_name(self) -> str:
+        """What to do about it — "Add submission", "Attempt quiz now" — or "" if nothing."""
+        return self.action.name if self.action else ""
+
+    @property
+    def actionable(self) -> bool:
+        """Whether the action can still be taken; an expired deadline still has an action."""
+        return bool(self.action and self.action.actionable)
+
+
 class CourseGrade(_Base):
     courseid: int
     grade: _Text = ""

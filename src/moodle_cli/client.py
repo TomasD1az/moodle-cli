@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import time
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Any
@@ -15,6 +16,7 @@ from moodle_cli.models import (
     Announcement,
     Assignment,
     AssignmentStatus,
+    CalendarEvent,
     Course,
     CourseGrade,
     Forum,
@@ -51,6 +53,7 @@ SORTS: dict[str, str] = {
 }
 
 _PARTICIPANT_PAGE_SIZE = 250
+_CALENDAR_PAGE_SIZE = 50
 
 
 def _flatten_params(params: dict[str, Any], prefix: str = "") -> dict[str, str]:
@@ -384,6 +387,59 @@ class MoodleClient:
         """
         course_ids = [course_id] if course_id is not None else None
         return next((q.grade for q in self.get_quizzes(course_ids) if q.id == quiz_id), None)
+
+    def get_calendar_events(
+        self,
+        *,
+        course_id: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 200,
+    ) -> list[CalendarEvent]:
+        """Dated, actionable items — what is due, and when.
+
+        The one endpoint that answers "what is coming up" for every course in a single
+        call, which is why it does not take a list of course ids: omitting ``course_id``
+        sweeps every enrolment server-side, including courses the dashboard hides.
+
+        ``since`` and ``until`` bound the window as epoch seconds; ``since`` defaults to
+        now, making the default answer "upcoming". Passing ``until=now`` instead is how a
+        caller asks for what is already overdue, since an overdue item's ``timesort`` is
+        in the past.
+
+        Moodle returns these a page at a time and identifies the next page by the last
+        event id seen, not by an offset. Paging here rather than in the caller is what
+        keeps a busy week from being silently cut off at the default of 20.
+        """
+        function = (
+            "core_calendar_get_action_events_by_course"
+            if course_id is not None
+            else "core_calendar_get_action_events_by_timesort"
+        )
+        events: list[CalendarEvent] = []
+        after_event_id = 0
+        while len(events) < limit:
+            page_size = min(_CALENDAR_PAGE_SIZE, limit - len(events))
+            params: dict[str, Any] = {
+                "timesortfrom": int(time.time()) if since is None else since,
+                "limitnum": page_size,
+            }
+            if until is not None:
+                params["timesortto"] = until
+            if after_event_id:
+                params["aftereventid"] = after_event_id
+            if course_id is not None:
+                params["courseid"] = course_id
+
+            body = self._call(function, **params)
+            page = [CalendarEvent.model_validate(e) for e in body.get("events") or []]
+            events.extend(page)
+            if len(page) < page_size:
+                break
+            # `lastid` is Moodle's own cursor; falling back to the last event's id keeps
+            # paging working on a response that omits it rather than looping forever.
+            after_event_id = int(body.get("lastid") or page[-1].id)
+        return events
 
     def get_grade_overview(self) -> list[CourseGrade]:
         """Course-level grade summary across every enrolled course.

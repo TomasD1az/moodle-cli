@@ -887,3 +887,133 @@ def test_only_the_documented_commands_lack_json_output() -> None:
                 missing.add((group_name, command_name))
 
     assert missing == CORE_COMMANDS_WITHOUT_JSON
+
+
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_courses_calendar_renders_deadlines_with_their_hour(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """A calendar prints the minute; every other table here prints the day."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Actividad semana 2" in result.output
+    assert "2026-03-19 18:00" in result.output
+    assert "IOS460 - 123246" in result.output
+    assert "next 14 days" in result.output
+
+
+@respx.mock
+def test_courses_calendar_labels_a_site_event_with_no_course(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """An event belonging to no course must render, not crash on a missing shortname."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Charla" in result.output
+
+
+@respx.mock
+def test_courses_calendar_overdue_asks_for_the_window_already_passed(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route = route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar", "--overdue", "--days", "7"])
+
+    assert result.exit_code == 0
+    assert "past 7 days" in result.output
+    params = {
+        k: v
+        for k, v in (
+            pair.split("=", 1)
+            for pair in route.calls[0].request.content.decode().split("&")
+            if "=" in pair
+        )
+    }
+    assert int(params["timesortto"]) >= int(params["timesortfrom"])
+
+
+@respx.mock
+def test_courses_calendar_json_names_the_course_and_keeps_the_offset(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    quiz_event = next(e for e in data if e["id"] == 990117)
+    assert quiz_event["course"] == "IOS460 - 123246"
+    assert quiz_event["activity"] == "quiz"
+    assert quiz_event["instance_id"] == 42628
+    assert quiz_event["due_at"] == epoch_to_datetime(1773954000).isoformat()  # type: ignore[union-attr]
+    assert data[1]["overdue"] is True
+    assert data[1]["actionable"] is False
+
+
+@respx.mock
+def test_courses_calendar_reports_an_empty_window_plainly(
+    courses_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort={"events": []},
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Nothing due" in result.output
+
+
+@respx.mock
+def test_course_calendar_narrows_server_side(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """One course goes through the by-course function, not a filtered campus sweep."""
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_calendar_get_action_events_by_course=calendar_payload,
+    )
+
+    result = runner.invoke(app, ["course", "calendar", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "IOS460 - 123246" in result.output
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert any(
+        "core_calendar_get_action_events_by_course" in body and "courseid=101" in body
+        for body in bodies
+    )
+
+
+@respx.mock
+def test_course_calendar_rejects_a_zero_day_window(courses_payload: dict[str, Any]) -> None:
+    """`--days 0` is a window with no width, which Typer rejects before any request."""
+    route_by_function(core_course_get_enrolled_courses_by_timeline_classification=courses_payload)
+
+    result = runner.invoke(app, ["course", "calendar", "IOS460", "--days", "0"])
+
+    assert result.exit_code == 2
