@@ -213,3 +213,23 @@ def test_course_updates_answers_for_every_course(live_client: MoodleClient) -> N
         assert all(u.updates for u in updates), "an unchanged activity must be dropped"
         return
     pytest.skip("no enrolled courses")
+
+
+def test_quiz_review_reads_back_a_finished_attempt(live_client: MoodleClient) -> None:
+    """Review options vary, so the contract asserted here is only what always holds."""
+    for quiz in live_client.get_quizzes():
+        status = live_client.get_quiz_status(quiz.id)
+        if not status.attempt_ids:
+            continue
+        try:
+            review = live_client.get_quiz_attempt_review(status.attempt_ids[-1])
+        except MoodleAPIError as exc:
+            # A quiz still open, or one whose review the teacher closed, is a real answer.
+            assert exc.errorcode in {"noreviewattempt", "noreview", "attemptclosed"}
+            return
+        assert all(q.slot > 0 for q in review.questions)
+        assert all(q.number for q in review.questions)
+        # Marks may be hidden, but a question that reports one must report a number.
+        assert all(q.mark_value is not None for q in review.questions if q.mark)
+        return
+    pytest.skip("no attempted quiz to review")

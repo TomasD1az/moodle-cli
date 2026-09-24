@@ -227,6 +227,18 @@ def quiz_attempts_payload() -> dict[str, Any]:
 
 
 @pytest.fixture
+def quiz_attempt_review_payload() -> dict[str, Any]:
+    """A finished attempt: one right, one wrong and flagged, one awaiting manual grading.
+
+    The third question is the shape worth having — Moodle omits ``mark``, ``maxmark`` and
+    ``state`` entirely for a question whose marks the reader may not see, so anything that
+    reads them as always-present breaks on an essay before it breaks on anything else.
+    """
+    payload: dict[str, Any] = load_fixture("quiz_attempt_review.json")
+    return payload
+
+
+@pytest.fixture
 def quiz_best_grade_payload() -> dict[str, Any]:
     payload: dict[str, Any] = load_fixture("quiz_best_grade.json")
     return payload

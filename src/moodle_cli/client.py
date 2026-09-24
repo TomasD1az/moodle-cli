@@ -16,6 +16,7 @@ from moodle_cli.models import (
     Announcement,
     Assignment,
     AssignmentStatus,
+    AttemptReview,
     CalendarEvent,
     Course,
     CourseGrade,
@@ -373,6 +374,7 @@ class MoodleClient:
 
         return QuizStatus(
             attempt_count=len(attempts),
+            attempt_ids=[int(a["id"]) for a in attempts if "id" in a],
             last_state=attempts[-1].get("state") if attempts else None,
             has_grade=has_grade,
             grade=grade_body.get("grade"),
@@ -388,6 +390,25 @@ class MoodleClient:
         """
         course_ids = [course_id] if course_id is not None else None
         return next((q.grade for q in self.get_quizzes(course_ids) if q.id == quiz_id), None)
+
+    def get_quiz_attempt_review(self, attempt_id: int, *, page: int = -1) -> AttemptReview:
+        """Read a finished attempt back, with its questions and any visible marks.
+
+        This is the endpoint behind the campus's own "Review" page, and it is read-only:
+        it reports an attempt that is already over and changes nothing. What it returns is
+        governed by the quiz's review options, so the same attempt yields more detail
+        after the quiz closes than while it is open.
+
+        ``page=-1`` asks for every page at once, which is what reading a whole attempt
+        wants; a real page number is for walking one screen at a time.
+
+        Questions arrive as rendered HTML rather than as structured data. That is Moodle's
+        own shape — the official mobile app renders the same markup — so any reader that
+        wants text has to strip it, which :attr:`AttemptQuestion.text` does.
+        """
+        body = self._call("mod_quiz_get_attempt_review", attemptid=attempt_id, page=page)
+        check_warnings(body, function="mod_quiz_get_attempt_review")
+        return AttemptReview.model_validate(body)
 
     def get_calendar_events(
         self,

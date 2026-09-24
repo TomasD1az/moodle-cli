@@ -27,6 +27,7 @@ from moodle_cli.mcp_server import (
     get_course_updates,
     get_grade_summary,
     get_grades,
+    get_quiz_review,
     get_quiz_status,
     get_quizzes,
     list_courses,
@@ -465,6 +466,7 @@ def test_get_quiz_status_reports_attempts_and_grade(
 
     assert result == {
         "attempts_used": 1,
+        "attempt_ids": [883899],
         "last_attempt_state": "finished",
         "grade_available": True,
         "grade": 6.925,
@@ -707,3 +709,55 @@ def test_get_course_updates_returns_nothing_for_a_quiet_course(
     assert get_course_updates("IOS460") == []
     bodies = [call.request.content.decode() for call in route.calls]
     assert not any("core_course_get_contents" in body for body in bodies)
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_get_quiz_review_returns_questions_as_text(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    review = get_quiz_review(883899)
+
+    assert review["attempt_number"] == 1
+    assert review["state"] == "finished"
+    assert review["grade"] == "6.93"
+    assert review["marks_visible"] is True
+    assert review["finished_at"] == _local_iso(1773848169)
+    first = review["questions"][0]
+    assert first["type"] == "multichoice"
+    assert first["mark"] == 1.0
+    assert "estructura de repetición" in first["text"]
+    assert "<div" not in first["text"]
+
+
+@respx.mock
+def test_get_quiz_review_reports_an_ungraded_question_as_null_not_zero(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """A mark awaiting manual grading is absent, which is not a mark of zero."""
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    essay = get_quiz_review(883899)["questions"][2]
+
+    assert essay["mark"] is None
+    assert essay["max_mark"] is None
+    assert essay["status"] == "Pendiente de calificación"
+
+
+@respx.mock
+def test_get_quiz_status_offers_attempt_ids_to_review(
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        mod_quiz_get_user_attempts=quiz_attempts_payload,
+        mod_quiz_get_user_best_grade=quiz_best_grade_payload,
+        mod_quiz_get_quizzes_by_courses=quizzes_payload,
+    )
+
+    assert get_quiz_status(42628)["attempt_ids"] == [883899]

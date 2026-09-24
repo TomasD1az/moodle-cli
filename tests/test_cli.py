@@ -1119,3 +1119,104 @@ def test_plural_handles_the_units_this_tool_counts(count: int, noun: str, expect
     from moodle_cli.cli import _plural
 
     assert _plural(count, noun) == expected
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_quiz_review_lists_questions_with_their_marks(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "attempt 1 (finished)" in result.output
+    assert "grade: 6.93" in result.output
+    assert "multichoice" in result.output
+    assert "1 / 1" in result.output
+    assert "3 questions" in result.output
+
+
+@respx.mock
+def test_quiz_review_prints_question_text_only_when_asked(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """The rendered HTML is long; the table stays scannable without it."""
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    without = runner.invoke(app, ["course", "quiz-review", "883899"])
+    with_text = runner.invoke(app, ["course", "quiz-review", "883899", "--questions"])
+
+    assert "estructura de repetición" not in without.output
+    assert "estructura de repetición" in with_text.output
+    assert "<div" not in with_text.output
+
+
+@respx.mock
+def test_quiz_review_says_so_when_review_is_not_permitted(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """No questions is a review option, not a failure."""
+    route_by_function(mod_quiz_get_attempt_review={**quiz_attempt_review_payload, "questions": []})
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "may not allow review yet" in result.output
+
+
+@respx.mock
+def test_quiz_review_warns_when_marks_are_hidden(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """An attempt with questions and no marks is a real state."""
+    hidden = [
+        {k: v for k, v in q.items() if k not in {"mark", "maxmark"}}
+        for q in quiz_attempt_review_payload["questions"]
+    ]
+    route_by_function(
+        mod_quiz_get_attempt_review={**quiz_attempt_review_payload, "questions": hidden}
+    )
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "Marks are hidden" in result.output
+
+
+@respx.mock
+def test_quiz_review_json_reports_an_ungraded_question_as_null(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["state"] == "finished"
+    assert data["questions"][0]["mark"] == 1.0
+    assert data["questions"][1]["flagged"] is True
+    assert data["questions"][2]["mark"] is None
+
+
+@respx.mock
+def test_quiz_status_points_at_the_attempt_ids(
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    """An attempt count with no ids leaves nothing to review."""
+    route_by_function(
+        mod_quiz_get_user_attempts=quiz_attempts_payload,
+        mod_quiz_get_user_best_grade=quiz_best_grade_payload,
+        mod_quiz_get_quizzes_by_courses=quizzes_payload,
+    )
+
+    result = runner.invoke(app, ["course", "quiz-status", "42628"])
+
+    assert result.exit_code == 0
+    assert "attempt ids: 883899" in result.output

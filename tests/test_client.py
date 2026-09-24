@@ -1019,3 +1019,95 @@ def test_get_course_updates_raises_on_a_warning(client: MoodleClient) -> None:
 
     with pytest.raises(MoodleAPIError):
         client.get_course_updates(101, since=1_773_000_000)
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_get_quiz_attempt_review_asks_for_every_page(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """page=-1 is what reading a whole attempt wants; a number walks one screen."""
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json=quiz_attempt_review_payload)
+    )
+
+    review = client.get_quiz_attempt_review(883899)
+
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "mod_quiz_get_attempt_review"
+    assert params["attemptid"] == "883899"
+    assert params["page"] == "-1"
+    assert review.grade == "6.93"
+    assert review.attempt is not None
+    assert review.attempt.state == "finished"
+
+
+@respx.mock
+def test_get_quiz_attempt_review_reads_a_question_with_no_marks(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """Moodle omits mark and maxmark where the reader may not see them."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=quiz_attempt_review_payload))
+
+    review = client.get_quiz_attempt_review(883899)
+
+    essay = review.questions[2]
+    assert essay.mark is None
+    assert essay.mark_value is None
+    assert essay.maxmark is None
+    assert essay.status == "Pendiente de calificación"
+    assert review.marks_visible is True  # the other two do carry marks
+
+
+@respx.mock
+def test_get_quiz_attempt_review_strips_the_rendered_html(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """Questions arrive as markup; a reader wants the words."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=quiz_attempt_review_payload))
+
+    first = client.get_quiz_attempt_review(883899).questions[0]
+
+    assert "¿Cuál de estas es una estructura de repetición?" in first.text
+    assert "<div" not in first.text
+    assert first.number == "1"
+    assert first.mark_value == 1.0
+
+
+@respx.mock
+def test_get_quiz_attempt_review_raises_on_a_warning(client: MoodleClient) -> None:
+    respx.post(REST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "questions": [],
+                "warnings": [{"warningcode": "noreviewattempt", "message": "Not allowed"}],
+            },
+        )
+    )
+
+    with pytest.raises(MoodleAPIError):
+        client.get_quiz_attempt_review(883899)
+
+
+@respx.mock
+def test_get_quiz_status_reports_the_attempt_ids(
+    client: MoodleClient,
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    """An attempt count with no ids leaves nothing to review."""
+    respx.post(REST_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=quiz_attempts_payload),
+            httpx.Response(200, json=quiz_best_grade_payload),
+            httpx.Response(200, json=quizzes_payload),
+        ]
+    )
+
+    status = client.get_quiz_status(42628)
+
+    assert status.attempt_ids == [883899]

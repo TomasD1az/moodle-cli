@@ -1148,6 +1148,9 @@ def course_quiz_status(
     console.print(f"attempts used: {status.attempt_count}")
     if status.last_state:
         console.print(f"last attempt: {status.last_state}")
+    if status.attempt_ids:
+        ids = ", ".join(str(i) for i in status.attempt_ids)
+        console.print(f"attempt ids: {ids}  [dim](for `course quiz-review`)[/dim]")
     if status.has_grade:
         # The grade arrives already scaled to the quiz maximum, so it reads as a
         # proportion only next to that maximum.
@@ -1158,6 +1161,88 @@ def course_quiz_status(
         # One flag covers never attempted, awaiting manual grading, and graded with the
         # marks hidden by the quiz's review options — so report availability, not grading.
         console.print("grade: not available (not graded yet, or hidden by the quiz)")
+
+
+@course_app.command("quiz-review")
+@handle_errors
+def course_quiz_review(
+    attempt_id: Annotated[
+        int, typer.Argument(help="Attempt id, as shown by `course quiz-status`.")
+    ],
+    questions: Annotated[
+        bool, typer.Option("--questions", help="Print each question's full text.")
+    ] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Read a finished quiz attempt back, with its questions and any visible marks.
+
+    This is the campus's own "Review" page, read from the command line. It is read-only:
+    the attempt is already over and nothing here changes it.
+
+    What comes back is governed by the quiz's review options, which the teacher sets. The
+    same attempt yields more after the quiz closes than while it is still open, and marks
+    can be withheld entirely — an attempt with questions and no marks is a real answer,
+    not a failure.
+
+    Moodle returns each question as rendered HTML, so `--questions` prints it stripped to
+    text. Expect the wording, the options and — where the review options allow it — the
+    feedback, laid out as one block per question rather than as structured fields.
+    """
+    with open_client() as client:
+        review = client.get_quiz_attempt_review(attempt_id)
+
+    if as_json:
+        _emit_json(
+            {
+                "attempt_id": attempt_id,
+                "state": review.attempt.state if review.attempt else None,
+                "grade": review.grade,
+                "marks_visible": review.marks_visible,
+                "questions": [
+                    {
+                        "number": q.number,
+                        "type": q.type,
+                        "status": q.status,
+                        "mark": q.mark_value,
+                        "max_mark": q.maxmark,
+                        "flagged": q.flagged,
+                        "text": q.text,
+                    }
+                    for q in review.questions
+                ],
+            }
+        )
+        return
+
+    attempt = review.attempt
+    if attempt:
+        finished = _format_moment(attempt.timefinish) if attempt.timefinish else "-"
+        console.print(f"attempt {attempt.attempt} ({attempt.state}), finished {finished}")
+    if review.grade is not None:
+        console.print(f"grade: {review.grade}")
+    if not review.questions:
+        console.print("[yellow]No questions returned; the quiz may not allow review yet.[/yellow]")
+        return
+    if not review.marks_visible:
+        console.print("[yellow]Marks are hidden by this quiz's review options.[/yellow]")
+
+    count = len(review.questions)
+    table = Table(title=f"{count} {_plural(count, 'question')}", expand=True)
+    table.add_column("#", justify="right", no_wrap=True, style="dim")
+    table.add_column("type", no_wrap=True, style="dim")
+    table.add_column("status", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("mark", justify="right", no_wrap=True)
+    for question in review.questions:
+        mark = question.mark_value
+        out_of = question.maxmark
+        cell = "-" if mark is None else f"{mark:g}" + (f" / {out_of:g}" if out_of else "")
+        table.add_row(question.number, question.type, escape(question.status or "-"), cell)
+    console.print(table)
+
+    if questions:
+        for question in review.questions:
+            console.print(f"\n[bold cyan]{question.number}.[/bold cyan] [dim]{question.type}[/dim]")
+            _print_block("   ", 3, question.text)
 
 
 @course_app.command("grades")

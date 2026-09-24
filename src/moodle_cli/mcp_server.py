@@ -566,6 +566,9 @@ def get_quiz_status(quiz_id: int, course: str | None = None) -> dict[str, Any]:
     `max_grade`. A false `grade_available` means the grade cannot be read — the quiz may
     be unattempted, awaiting manual grading, or graded with the marks hidden.
 
+    `attempt_ids` are oldest first; pass one to get_quiz_review to read that attempt's
+    questions and per-question marks back.
+
     Pass the `course` the quiz came from whenever it is known. Reading `max_grade` means
     finding the quiz, and a quiz id alone does not say which course holds it, so without
     this the lookup sweeps every enrolment: checking a course's quizzes one by one pulls
@@ -578,11 +581,63 @@ def get_quiz_status(quiz_id: int, course: str | None = None) -> dict[str, Any]:
 
     return {
         "attempts_used": status.attempt_count,
+        "attempt_ids": status.attempt_ids,
         "last_attempt_state": status.last_state,
         "grade_available": status.has_grade,
         "grade": status.grade,
         "grade_to_pass": status.grade_to_pass,
         "max_grade": status.max_grade,
+    }
+
+
+@mcp.tool()
+def get_quiz_review(attempt_id: int) -> dict[str, Any]:
+    """Read a finished quiz attempt back, with its questions and any visible marks.
+
+    `attempt_id` comes from get_quiz_status's `attempt_ids`. This is the campus's own
+    "Review" page and it is read-only: the attempt is already over and nothing here
+    changes it.
+
+    What comes back is governed by the quiz's review options. The same attempt yields
+    more after the quiz closes than while it is open, and marks can be withheld entirely,
+    so `marks_visible: false` with questions present is a real answer and not a failure.
+    An empty `questions` list means review is not permitted yet.
+
+    Each question's `text` is Moodle's rendered HTML stripped to plain text — the whole
+    question as the browser would draw it, including its options and, where the review
+    options allow it, its feedback. It is one block of prose per question, not structured
+    fields: the API has no structured form of a question to offer.
+
+    `mark` is null where the mark is hidden or the question is still awaiting manual
+    grading, which is not the same as a mark of zero.
+    """
+    client = open_client()
+    with client:
+        review = client.get_quiz_attempt_review(attempt_id)
+
+    return {
+        "attempt_id": attempt_id,
+        "attempt_number": review.attempt.attempt if review.attempt else None,
+        "state": review.attempt.state if review.attempt else None,
+        "finished_at": (
+            review.attempt.finished_at.isoformat()
+            if review.attempt and review.attempt.finished_at
+            else None
+        ),
+        "grade": review.grade,
+        "marks_visible": review.marks_visible,
+        "questions": [
+            {
+                "number": q.number,
+                "type": q.type,
+                "status": q.status or None,
+                "mark": q.mark_value,
+                "max_mark": q.maxmark,
+                "flagged": q.flagged,
+                "text": q.text,
+            }
+            for q in review.questions
+        ],
     }
 
 
