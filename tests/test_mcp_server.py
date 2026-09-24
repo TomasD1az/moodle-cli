@@ -24,6 +24,7 @@ from moodle_cli.mcp_server import (
     get_calendar,
     get_course_announcements,
     get_course_contents,
+    get_course_updates,
     get_grade_summary,
     get_grades,
     get_quiz_status,
@@ -665,3 +666,44 @@ def test_get_calendar_overdue_looks_backwards(
     body = route.calls[0].request.content.decode()
     params = dict(pair.split("=", 1) for pair in body.split("&") if "=" in pair)
     assert int(params["timesortto"]) - int(params["timesortfrom"]) == 7 * 86_400
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_course_updates_names_activities_and_orders_newest_first(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    results = get_course_updates("IOS460")
+
+    assert results[0] == {
+        "cmid": 2,
+        "activity": "Programa de la materia",
+        "changed": ["configuration", "contentfiles"],
+        "changed_at": _local_iso(1773511440),
+    }
+    assert [row["cmid"] for row in results] == [2, 5, 4041]
+    assert results[2]["activity"] is None
+
+
+@respx.mock
+def test_get_course_updates_returns_nothing_for_a_quiet_course(
+    courses_payload: dict[str, Any],
+) -> None:
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since={"instances": [], "warnings": []},
+    )
+
+    assert get_course_updates("IOS460") == []
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert not any("core_course_get_contents" in body for body in bodies)

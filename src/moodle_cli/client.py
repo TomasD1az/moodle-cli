@@ -19,6 +19,7 @@ from moodle_cli.models import (
     CalendarEvent,
     Course,
     CourseGrade,
+    CourseUpdate,
     Forum,
     GradeItem,
     Participant,
@@ -440,6 +441,26 @@ class MoodleClient:
             # paging working on a response that omits it rather than looping forever.
             after_event_id = int(body.get("lastid") or page[-1].id)
         return events
+
+    def get_course_updates(self, course_id: int, since: int) -> list[CourseUpdate]:
+        """What changed in a course's activities since ``since`` (epoch seconds).
+
+        The cheap way to ask "is there anything new": one call per course returns only
+        the activities that moved, where noticing the same thing by diffing course
+        contents means fetching every section, file and description each time.
+
+        Moodle answers with course-module ids and area names, not with activity names or
+        file lists — ``core_course_get_contents`` is what turns an id into something a
+        reader recognises, and the caller joins the two.
+
+        Activities with no changes are dropped rather than returned empty: Moodle lists an
+        instance for every module it checked, so keeping them would report a quiet course
+        as dozens of rows saying nothing happened.
+        """
+        body = self._call("core_course_get_updates_since", courseid=course_id, since=since)
+        check_warnings(body, function="core_course_get_updates_since")
+        updates = [CourseUpdate.model_validate(i) for i in body.get("instances") or []]
+        return [u for u in updates if u.updates]
 
     def get_grade_overview(self) -> list[CourseGrade]:
         """Course-level grade summary across every enrolled course.

@@ -155,7 +155,17 @@ def _format_epoch(value: int, fmt: str = "%Y-%m-%d") -> str:
 
 
 def _plural(count: int, noun: str) -> str:
-    return noun if count == 1 else f"{noun}s"
+    """Pluralise a table's unit noun.
+
+    The -y rule is here because "activity" is the first unit this tool counts that is not
+    regular, and "3 activitys" is the kind of wrong that gets read as a broken command.
+    A consonant before the y is what distinguishes it from "day", which keeps its own.
+    """
+    if count == 1:
+        return noun
+    if noun.endswith("y") and len(noun) > 1 and noun[-2] not in "aeiou":
+        return f"{noun[:-1]}ies"
+    return f"{noun}s"
 
 
 def _format_moment(value: int) -> str:
@@ -924,6 +934,88 @@ def course_calendar(
     _print_events(
         events, {found.id: found.shortname}, f"{found.shortname}: {len(events)} due, {window}"
     )
+
+
+@course_app.command("updates")
+@handle_errors
+def course_updates(
+    course: CourseArg,
+    days: DaysOpt = 7,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show which of a course's activities changed recently.
+
+    Answers "is there anything new" in two calls rather than by re-reading the whole
+    course and comparing: Moodle tracks the change itself and reports only the activities
+    that moved. The second call is `course contents`, which is what turns the
+    course-module ids it answers with into activity names.
+
+    The areas are Moodle's own and are reported unchanged: `contentfiles` is a new or
+    replaced file, `introfiles` an attachment on the description, `configuration` a
+    setting such as a due date, `gradeitems` a change to how it is graded.
+
+    A teacher editing an activity updates it whether or not anything you can see changed,
+    so this reports movement rather than news.
+    """
+    since = int(time.time()) - days * 86_400
+    with open_client() as client:
+        resolved = client.resolve_course(course)
+        updates = client.get_course_updates(resolved.id, since)
+        # Only worth a second round trip when something actually changed.
+        module_names = _module_names(client, resolved.id) if updates else {}
+
+    updates.sort(key=lambda u: u.latest_epoch, reverse=True)
+
+    if as_json:
+        _emit_json(
+            [
+                {
+                    "cmid": u.id,
+                    "activity": module_names.get(u.id),
+                    "changed": u.area_names,
+                    "changed_at": u.last_updated.isoformat() if u.last_updated else None,
+                }
+                for u in updates
+            ]
+        )
+        return
+
+    window = _window_label(days, overdue=True)
+    if not updates:
+        console.print(f"Nothing changed in {escape(resolved.shortname)} in the {window}.")
+        return
+
+    count = len(updates)
+    table = Table(
+        title=f"{resolved.shortname}: {count} {_plural(count, 'activity')} changed, {window}",
+        expand=True,
+    )
+    table.add_column("changed", no_wrap=True)
+    table.add_column("activity", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("what", ratio=1, min_width=16, overflow="fold", style="dim")
+    for update in updates:
+        moment = update.last_updated
+        table.add_row(
+            moment.strftime("%Y-%m-%d %H:%M") if moment else "-",
+            escape(module_names.get(update.id) or f"cmid {update.id}"),
+            escape(", ".join(update.area_names) or "-"),
+        )
+    console.print(table)
+
+
+def _module_names(client: MoodleClient, course_id: int) -> dict[int, str]:
+    """Activity name per course-module id.
+
+    The updates endpoint answers with ids alone, and a course-module id means nothing to
+    a reader. A label carries its text in the description rather than the name, the same
+    way `course contents` reads it.
+    """
+    names: dict[int, str] = {}
+    for section in client.get_course_contents(course_id):
+        for module in section.modules:
+            is_label = module.modname == "label"
+            names[module.id] = (module.description_text if is_label else module.name) or module.name
+    return names
 
 
 @course_app.command("assignments")

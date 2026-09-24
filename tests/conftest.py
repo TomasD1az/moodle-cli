@@ -197,6 +197,19 @@ def calendar_payload() -> dict[str, Any]:
 
 
 @pytest.fixture
+def course_updates_payload() -> dict[str, Any]:
+    """Two activities the contents fixture names, one it does not, and one that is quiet.
+
+    The unnamed course-module id is the realistic case the join cannot cover: an activity
+    can change and still not be in the contents a student is allowed to see. The instance
+    with an empty ``updates`` array is what Moodle sends for a module it checked and
+    found unchanged.
+    """
+    payload: dict[str, Any] = load_fixture("course_updates.json")
+    return payload
+
+
+@pytest.fixture
 def site_info_payload() -> dict[str, Any]:
     return {"userid": 63643, "functions": []}
 

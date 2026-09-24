@@ -1017,3 +1017,105 @@ def test_course_calendar_rejects_a_zero_day_window(courses_payload: dict[str, An
     result = runner.invoke(app, ["course", "calendar", "IOS460", "--days", "0"])
 
     assert result.exit_code == 2
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_course_updates_names_activities_from_the_contents(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    """The endpoint answers with course-module ids; the names come from the contents."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "Programa de la materia" in result.output
+    assert "contentfiles" in result.output
+    assert "2 activities changed" not in result.output  # three changed, one was quiet
+    assert "3 activities changed" in result.output
+
+
+@respx.mock
+def test_course_updates_falls_back_to_the_cmid_when_unnamed(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    """An activity can change and still not appear in the contents you may read."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "cmid 4041" in result.output
+
+
+@respx.mock
+def test_course_updates_skips_the_contents_call_when_nothing_changed(
+    courses_payload: dict[str, Any],
+) -> None:
+    """A quiet course costs one call, not two."""
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since={"instances": [], "warnings": []},
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "Nothing changed" in result.output
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert not any("core_course_get_contents" in body for body in bodies)
+
+
+@respx.mock
+def test_course_updates_json_orders_newest_first(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert [row["cmid"] for row in data] == [2, 5, 4041]
+    assert data[0]["activity"] == "Programa de la materia"
+    assert data[0]["changed"] == ["configuration", "contentfiles"]
+    assert data[0]["changed_at"] == epoch_to_datetime(1773511440).isoformat()  # type: ignore[union-attr]
+    assert data[2]["activity"] is None
+
+
+@pytest.mark.parametrize(
+    ("count", "noun", "expected"),
+    [
+        (1, "course", "course"),
+        (2, "course", "courses"),
+        (2, "day", "days"),
+        (1, "activity", "activity"),
+        (3, "activity", "activities"),
+    ],
+)
+def test_plural_handles_the_units_this_tool_counts(count: int, noun: str, expected: str) -> None:
+    """ "3 activitys" reads as a broken command rather than as a count."""
+    from moodle_cli.cli import _plural
+
+    assert _plural(count, noun) == expected

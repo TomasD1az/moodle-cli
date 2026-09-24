@@ -404,6 +404,53 @@ def get_calendar(
 
 
 @mcp.tool()
+def get_course_updates(course: str, days: int = 7) -> list[dict[str, Any]]:
+    """Which of a course's activities changed in the last `days` days.
+
+    Use this to check for new material instead of re-reading get_course_contents and
+    comparing: Moodle tracks the change itself, so this answers in two calls and returns
+    only what moved.
+
+    `changed` carries Moodle's own area names, untranslated: `contentfiles` is a new or
+    replaced file, `introfiles` an attachment on the description, `configuration` a
+    setting such as a due date, `gradeitems` a change to grading. The set is open-ended
+    and module-specific, so treat an unfamiliar name as "this part of the activity
+    changed" rather than as an error.
+
+    A teacher editing an activity marks it changed whether or not anything visible
+    differs, so this reports movement, not news. To see what the activity now holds, call
+    get_course_contents and read the named activity.
+    """
+    since = int(time.time()) - days * 86_400
+    client = open_client()
+    with client:
+        resolved = client.resolve_course(course)
+        updates = client.get_course_updates(resolved.id, since)
+        module_names = _module_names(client, resolved.id) if updates else {}
+
+    updates.sort(key=lambda u: u.latest_epoch, reverse=True)
+    return [
+        {
+            "cmid": u.id,
+            "activity": module_names.get(u.id),
+            "changed": u.area_names,
+            "changed_at": u.last_updated.isoformat() if u.last_updated else None,
+        }
+        for u in updates
+    ]
+
+
+def _module_names(client: MoodleClient, course_id: int) -> dict[int, str]:
+    """Activity name per course-module id; the updates endpoint answers with ids alone."""
+    names: dict[int, str] = {}
+    for section in client.get_course_contents(course_id):
+        for module in section.modules:
+            is_label = module.modname == "label"
+            names[module.id] = (module.description_text if is_label else module.name) or module.name
+    return names
+
+
+@mcp.tool()
 def get_assignments(course: str | None = None) -> list[dict[str, Any]]:
     """List assignments and their due dates.
 

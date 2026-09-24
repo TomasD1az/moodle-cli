@@ -970,3 +970,52 @@ def test_get_announcements_batches_one_call_per_news_forum(
         if "wsfunction=mod_forum_get_forum_discussions" in call.request.content.decode()
     ]
     assert per_forum == []  # they went inside the batch instead
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_course_updates_drops_activities_that_did_not_change(
+    client: MoodleClient, course_updates_payload: dict[str, Any]
+) -> None:
+    """Moodle lists every module it checked; a quiet one is not news."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=course_updates_payload))
+
+    updates = client.get_course_updates(101, since=1_773_000_000)
+
+    assert [u.id for u in updates] == [2, 5, 4041]
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_course_get_updates_since"
+    assert params["courseid"] == "101"
+    assert params["since"] == "1773000000"
+
+
+@respx.mock
+def test_get_course_updates_reports_the_most_recent_area(
+    client: MoodleClient, course_updates_payload: dict[str, Any]
+) -> None:
+    """An activity with two changed areas is dated by the later of the two."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=course_updates_payload))
+
+    first = client.get_course_updates(101, since=1_773_000_000)[0]
+
+    assert first.area_names == ["configuration", "contentfiles"]
+    assert first.latest_epoch == 1773511440
+
+
+@respx.mock
+def test_get_course_updates_raises_on_a_warning(client: MoodleClient) -> None:
+    """A partial answer must not be indistinguishable from a quiet course."""
+    respx.post(REST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "instances": [],
+                "warnings": [{"warningcode": "errorcoursecontentnotavailable", "message": "No"}],
+            },
+        )
+    )
+
+    with pytest.raises(MoodleAPIError):
+        client.get_course_updates(101, since=1_773_000_000)

@@ -408,6 +408,57 @@ class CalendarEvent(_Base):
         return bool(self.action and self.action.actionable)
 
 
+class UpdateArea(_Base):
+    """One part of an activity that changed, and when.
+
+    ``name`` is Moodle's own area name — ``configuration``, ``contentfiles``,
+    ``introfiles``, ``gradeitems``, ``comments`` and so on. It is not translated here: the
+    set is open-ended and module-specific, and inventing a friendly label for the ones we
+    happen to know would quietly hide every area we do not.
+    """
+
+    name: _Text = ""
+    timeupdated: _Epoch = 0
+    itemids: list[int] = Field(default_factory=list)
+
+    @property
+    def updated_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timeupdated)
+
+
+class CourseUpdate(_Base):
+    """What changed in one activity since a given moment.
+
+    ``id`` is the course-module id, which is what ``core_course_get_contents`` reports as
+    a module's ``id`` — that is the join that turns this into an activity name. The
+    endpoint answers with ids alone, so on its own this says something changed without
+    saying what it was.
+    """
+
+    contextlevel: _Text = ""
+    id: int = 0
+    updates: list[UpdateArea] = Field(default_factory=list)
+
+    @property
+    def area_names(self) -> list[str]:
+        return [u.name for u in self.updates if u.name]
+
+    @property
+    def latest_epoch(self) -> int:
+        """The most recent change across every area, as Moodle stores it.
+
+        Sorting goes through this rather than through :attr:`last_updated`: an activity
+        with no timestamped area converts to ``None``, which cannot be ordered against a
+        datetime, and 0 can.
+        """
+        return max((u.timeupdated for u in self.updates), default=0)
+
+    @property
+    def last_updated(self) -> datetime | None:
+        """The most recent change across every area, in the reader's zone."""
+        return epoch_to_datetime(self.latest_epoch)
+
+
 class CourseGrade(_Base):
     courseid: int
     grade: _Text = ""

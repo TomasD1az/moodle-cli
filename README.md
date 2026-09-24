@@ -157,6 +157,12 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | `moodle courses calendar` | `get_calendar` | Show what is due across every enrolled course. |
 | `moodle course calendar` | `get_calendar` | Show what is due in one course. |
 
+### [Course updates](docs/updates.md)
+
+| CLI | MCP tool | Description |
+| --- | --- | --- |
+| `moodle course updates` | `get_course_updates` | Show which of a course's activities changed recently. |
+
 ### [Assignments](docs/assignments.md)
 
 | CLI | MCP tool | Description |
