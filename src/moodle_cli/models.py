@@ -313,6 +313,8 @@ class QuizStatus(_Base):
     """
 
     attempt_count: int = 0
+    #: Attempt ids, oldest first — what `course quiz-review` takes.
+    attempt_ids: list[int] = Field(default_factory=list)
     last_state: str | None = None
     #: Whether a grade is available to read; a hidden or pending grade is also False.
     has_grade: bool = False
@@ -320,6 +322,234 @@ class QuizStatus(_Base):
     grade_to_pass: float | None = None
     #: The maximum ``grade`` and ``grade_to_pass`` are scaled to.
     max_grade: float | None = None
+
+
+class EventAction(_Base):
+    """What a calendar event is asking you to do, and whether it is still open.
+
+    ``actionable`` is Moodle's own answer to "can this be acted on right now": a quiz
+    outside its window and an assignment past its cutoff both still carry an action, and
+    only this flag tells them apart from one you can still act on.
+    """
+
+    name: _Text = ""
+    url: _Text = ""
+    itemcount: int = 0
+    actionable: bool = False
+
+
+class EventCourse(_Base):
+    """The course an event belongs to, as the calendar endpoints nest it.
+
+    A site-level event carries no course at all, which is why the parent field is
+    nullable rather than defaulted: "no course" and "course 0" are different answers.
+    """
+
+    id: int = 0
+    shortname: _Text = ""
+    fullname: _Text = ""
+
+
+class CalendarEvent(_Base):
+    """A dated, actionable item: an assignment due, a quiz closing, a chat starting.
+
+    These are *action* events, not the whole calendar. Moodle builds them per activity
+    module, so an event exists only where a module chose to publish one — which is what
+    makes this the one endpoint that answers "what is due" across every course at once,
+    and also why a deadline a teacher wrote into a page rather than into a due date will
+    never appear here.
+
+    ``timesort`` is the field to order by, not ``timestart``: for an event with a
+    duration the two differ, and the calendar's own ordering is by ``timesort``.
+    """
+
+    id: int
+    name: _Text = ""
+    description: _Text = ""
+    eventtype: _Text = ""
+    #: The activity type, e.g. ``assign`` or ``quiz``. Empty for a non-module event.
+    modulename: _Text = ""
+    #: The activity instance id, which is what the per-activity endpoints take.
+    instance: int = 0
+    timestart: _Epoch = 0
+    timesort: _Epoch = 0
+    timeduration: _Epoch = 0
+    overdue: bool = False
+    url: _Text = ""
+    viewurl: _Text = ""
+    course: EventCourse | None = None
+    action: EventAction | None = None
+
+    @property
+    def starts_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timestart)
+
+    @property
+    def sorts_at(self) -> datetime | None:
+        """The instant the calendar orders this event by; the deadline, for a deadline."""
+        return epoch_to_datetime(self.timesort)
+
+    @property
+    def description_text(self) -> str:
+        """``description`` as plain text; the calendar stores it as HTML."""
+        return html_to_text(self.description)
+
+    @property
+    def course_id(self) -> int:
+        """0 for a site-level event, which belongs to no course."""
+        return self.course.id if self.course else 0
+
+    @property
+    def action_name(self) -> str:
+        """What to do about it — "Add submission", "Attempt quiz now" — or "" if nothing."""
+        return self.action.name if self.action else ""
+
+    @property
+    def actionable(self) -> bool:
+        """Whether the action can still be taken; an expired deadline still has an action."""
+        return bool(self.action and self.action.actionable)
+
+
+class UpdateArea(_Base):
+    """One part of an activity that changed, and when.
+
+    ``name`` is Moodle's own area name — ``configuration``, ``contentfiles``,
+    ``introfiles``, ``gradeitems``, ``comments`` and so on. It is not translated here: the
+    set is open-ended and module-specific, and inventing a friendly label for the ones we
+    happen to know would quietly hide every area we do not.
+    """
+
+    name: _Text = ""
+    timeupdated: _Epoch = 0
+    itemids: list[int] = Field(default_factory=list)
+
+    @property
+    def updated_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timeupdated)
+
+
+class CourseUpdate(_Base):
+    """What changed in one activity since a given moment.
+
+    ``id`` is the course-module id, which is what ``core_course_get_contents`` reports as
+    a module's ``id`` — that is the join that turns this into an activity name. The
+    endpoint answers with ids alone, so on its own this says something changed without
+    saying what it was.
+    """
+
+    contextlevel: _Text = ""
+    id: int = 0
+    updates: list[UpdateArea] = Field(default_factory=list)
+
+    @property
+    def area_names(self) -> list[str]:
+        return [u.name for u in self.updates if u.name]
+
+    @property
+    def latest_epoch(self) -> int:
+        """The most recent change across every area, as Moodle stores it.
+
+        Sorting goes through this rather than through :attr:`last_updated`: an activity
+        with no timestamped area converts to ``None``, which cannot be ordered against a
+        datetime, and 0 can.
+        """
+        return max((u.timeupdated for u in self.updates), default=0)
+
+    @property
+    def last_updated(self) -> datetime | None:
+        """The most recent change across every area, in the reader's zone."""
+        return epoch_to_datetime(self.latest_epoch)
+
+
+class AttemptQuestion(_Base):
+    """One question inside a finished quiz attempt.
+
+    Moodle does not answer with structured question data: ``html`` is the question as the
+    browser would draw it, answers, feedback and all. That is a deliberate upstream
+    choice, not an omission — the official mobile app renders the same HTML. Anything
+    that wants the text rather than the markup goes through :attr:`text`.
+
+    ``mark``, ``maxmark``, ``state`` and ``status`` are returned *only* when the quiz's
+    review options let this student see them. A teacher who hides marks until everyone
+    has finished produces an attempt with questions and no marks, which is a real state
+    and not an error.
+    """
+
+    slot: int = 0
+    questionnumber: _Text = ""
+    type: _Text = ""
+    page: int = 0
+    html: _Text = ""
+    status: _Text = ""
+    state: _Text = ""
+    mark: str | None = None
+    maxmark: float | None = None
+    flagged: bool = False
+
+    @property
+    def number(self) -> str:
+        """What to label the question with; Moodle allows "7", "i" or "Custom-B)"."""
+        return self.questionnumber or str(self.slot)
+
+    @property
+    def text(self) -> str:
+        """The rendered question as plain text."""
+        return html_to_text(self.html)
+
+    @property
+    def mark_value(self) -> float | None:
+        """``mark`` as a number, or None when it is hidden or not numeric.
+
+        Moodle sends the mark as a preformatted string because it is display output, and
+        an empty one means "you may not see this" rather than zero.
+        """
+        try:
+            return float(self.mark) if self.mark else None
+        except ValueError:
+            return None
+
+
+class QuizAttempt(_Base):
+    """One attempt's own record, without its questions."""
+
+    id: int
+    quiz: int = 0
+    attempt: int = 0
+    state: _Text = ""
+    timestart: _Epoch = 0
+    timefinish: _Epoch = 0
+
+    @property
+    def started_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timestart)
+
+    @property
+    def finished_at(self) -> datetime | None:
+        return epoch_to_datetime(self.timefinish)
+
+
+class AttemptReview(_Base):
+    """A finished attempt, read back with its questions and whatever marks are visible.
+
+    Read-only: this is the endpoint behind the campus's own "Review" page. What it shows
+    is governed by the quiz's review options, so two students on the same quiz can get
+    different amounts of detail out of it, and the same student gets more after the quiz
+    closes than during it.
+    """
+
+    grade: str | None = None
+    attempt: QuizAttempt | None = None
+    questions: list[AttemptQuestion] = Field(default_factory=list)
+
+    @property
+    def marks_visible(self) -> bool:
+        """Whether this attempt came back with per-question marks at all."""
+        return any(q.mark is not None for q in self.questions)
+
+    @property
+    def total_max(self) -> float:
+        """The marks available across the questions that reported a maximum."""
+        return sum(q.maxmark or 0.0 for q in self.questions)
 
 
 class CourseGrade(_Base):

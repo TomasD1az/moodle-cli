@@ -1,5 +1,7 @@
 # Downloading files
 
+## One course
+
 CLI: `moodle course download`
 MCP: `download_course_files`
 
@@ -71,4 +73,42 @@ A real run replaces `dry_run` with a `summary`, and each file's `status` becomes
     {"path": "CS101/Week 1/syllabus.pdf", "size": 204800, "module_type": "resource", "status": "downloaded"}
   ]
 }
+```
+
+## Every course
+
+CLI: `moodle courses download`
+MCP: none — an agent asks per course, which is also how it names what it got.
+
+```
+moodle courses download [--output, -o PATH] [--view VIEW] [--type TYPE]
+                        [--match GLOB] [--links] [--dry-run] [--overwrite]
+```
+
+| Option | Description |
+| --- | --- |
+| `--output`, `-o PATH` | Parent directory. Default: the current one. |
+| `--view VIEW` | Which courses to include. Same values as `courses list`. Default `all`. |
+
+The same download as above, swept across your enrolment: each course lands in its own
+subdirectory named after its shortname, mirroring its sections inside. Re-running is as
+cheap as it is for one course, since a file already on disk at the expected size is
+skipped.
+
+`--file` and `--section` are not offered here, and the command rejects them. A filename or
+a section number identifies something inside *one* course; asked across every course it
+would either fail on the first course that lacks it or mean something different in each.
+`--type` and `--match` describe files rather than positions, so they carry across.
+
+A course that cannot be read is reported and skipped rather than ending the run — over a
+whole enrolment, an archived or restricted course is ordinary rather than exceptional.
+
+```
+  skip  I204 - 101313: No tiene permiso [nopermissions]
+I310 - 106934: 12 files, 31.2 MB -> I310 - 106934/
+  ok    01 - Unidad 1/apunte.pdf (2.1 MB)
+IOS460 - 123246: 3 files, 4.9 MB -> IOS460 - 123246/
+  skip  01 - Presentación/Programa - Taller.pdf
+
+14 downloaded, 1 already present across 2 courses
 ```

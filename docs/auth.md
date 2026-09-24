@@ -43,6 +43,16 @@ Authenticated as Jane Doe (id 42)
   file downloads allowed: True
 ```
 
+## `moodle auth capabilities`
+
+```
+moodle auth capabilities [--functions] [--json]
+```
+
+Shows which of this tool's features the campus actually exposes to your token, and names
+the web-service functions a missing one would need. See
+[Campus capabilities](capabilities.md).
+
 ## `moodle auth logout`
 
 ```

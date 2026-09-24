@@ -12,6 +12,7 @@ Works with any Moodle instance that has web services and the mobile service enab
 - [MCP server](#mcp-server)
 - [Plugins](#plugins)
 - [Command reference](#command-reference)
+- [What your campus supports](#what-your-campus-supports)
 - [Configuration](#configuration)
 - [Exit codes](#exit-codes)
 - [Things worth knowing](#things-worth-knowing)
@@ -94,7 +95,8 @@ taken as fatal. See [docs/plugins.md](docs/plugins.md).
 
 Every command that answers a question accepts `--json`, which prints machine-readable
 output instead of a table. The ones that act rather than answer do not: `auth login`,
-`auth status`, `auth logout` and `course download` report progress as they go.
+`auth status`, `auth logout`, `course download` and `courses download` report progress as
+they go.
 Commands that take a course accept either its numeric id or a shortname prefix; a
 prefix matching more than one course is an error listing the candidates.
 
@@ -107,6 +109,7 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | --- | --- |
 | `moodle auth login` | Mint a token and store it in the keyring. |
 | `moodle auth status` | Show who the stored token belongs to, and what it can do. |
+| `moodle auth capabilities` | Show which features this campus exposes to this token. |
 | `moodle auth logout` | Delete the stored token. |
 
 ### [Updating](docs/updating.md)
@@ -137,6 +140,7 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | CLI | MCP tool | Description |
 | --- | --- | --- |
 | `moodle course download` | `download_course_files` | Download a course's files, narrowed by section, type, name or glob. |
+| `moodle courses download` | — | Download every enrolled course into one directory per course. |
 
 ### [Participants](docs/participants.md)
 
@@ -149,6 +153,19 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | CLI | MCP tool | Description |
 | --- | --- | --- |
 | `moodle course announcements` | `get_course_announcements` | List a course's news-forum posts. |
+
+### [Calendar](docs/calendar.md)
+
+| CLI | MCP tool | Description |
+| --- | --- | --- |
+| `moodle courses calendar` | `get_calendar` | Show what is due across every enrolled course. |
+| `moodle course calendar` | `get_calendar` | Show what is due in one course. |
+
+### [Course updates](docs/updates.md)
+
+| CLI | MCP tool | Description |
+| --- | --- | --- |
+| `moodle course updates` | `get_course_updates` | Show which of a course's activities changed recently. |
 
 ### [Assignments](docs/assignments.md)
 
@@ -164,6 +181,7 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | --- | --- | --- |
 | `moodle course quizzes` | `get_quizzes` | List a course's quizzes and their open/close windows. |
 | `moodle course quiz-status` | `get_quiz_status` | Show attempt count and best grade for one quiz. |
+| `moodle course quiz-review` | `get_quiz_review` | Read a finished attempt back, with its questions and marks. |
 
 ### [Grades](docs/grades.md)
 
@@ -171,6 +189,20 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | --- | --- | --- |
 | `moodle courses grades` | `get_grade_summary` | Show a grade summary across every enrolled course. |
 | `moodle course grades` | `get_grades` | Show the per-item grade breakdown for one course. |
+
+## What your campus supports
+
+Campuses enable different slices of Moodle's web-service API, so a command failing is as
+likely to be a campus setting as a bug:
+
+```bash
+moodle auth capabilities
+```
+
+That lists which features your token can actually reach and names the web-service
+functions a missing one would need — which is what you would ask a Moodle administrator
+to enable. Features shown with no command are ones your campus supports and this tool does
+not implement yet. See [docs/capabilities.md](docs/capabilities.md).
 
 ## Configuration
 
@@ -220,6 +252,18 @@ names the following day for anyone east of the campus: 23:59 in Buenos Aires is 
 next morning in Rome. Every MCP timestamp therefore carries its offset, `due_at` and
 `closes_at` included. The CLI tables still print a date, which is the right granularity to
 read at a glance and the wrong one to compute a deadline from.
+
+**Repeated calls in one command are batched where the campus allows it.** Where the
+number of requests grows with the size of an enrolment — one per course's news forum, for
+instance — they go out together through `tool_mobile_call_external_functions`, which is
+the endpoint the official mobile app uses for the same reason. A campus that does not
+expose it gets one request each instead, and nothing else about the answer changes.
+`moodle auth capabilities` reports which of the two your campus is.
+
+**Course lists are read once per command, not once per question.** A single command often
+needs the enrolment twice — to turn a shortname into an id, and to label rows that carry
+only an id. That is cached for the life of one command and never written to disk, so a
+course you enrol in shows up on the very next run.
 
 **A broken plugin is skipped, not fatal.** A plugin that fails to import, targets a
 different contract version, or claims a command name this tool owns is left out with a

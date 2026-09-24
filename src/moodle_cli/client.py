@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+import json
+import time
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Any
@@ -14,8 +16,11 @@ from moodle_cli.models import (
     Announcement,
     Assignment,
     AssignmentStatus,
+    AttemptReview,
+    CalendarEvent,
     Course,
     CourseGrade,
+    CourseUpdate,
     Forum,
     GradeItem,
     Participant,
@@ -26,6 +31,10 @@ from moodle_cli.models import (
 )
 
 REST_PATH = "/webservice/rest/server.php"
+
+#: The mobile app's multi-call endpoint. Not every campus exposes it, so every use of it
+#: goes through :meth:`MoodleClient.call_many`, which falls back to one request each.
+BATCH_FUNCTION = "tool_mobile_call_external_functions"
 
 #: Public filter name -> Moodle ``classification`` value, read off the dashboard dropdown.
 VIEWS: dict[str, str] = {
@@ -46,6 +55,7 @@ SORTS: dict[str, str] = {
 }
 
 _PARTICIPANT_PAGE_SIZE = 250
+_CALENDAR_PAGE_SIZE = 50
 
 
 def _flatten_params(params: dict[str, Any], prefix: str = "") -> dict[str, str]:
@@ -96,6 +106,12 @@ class MoodleClient:
         self.token = token
         self._owns_client = client is None
         self._http = client or httpx.Client(timeout=timeout, follow_redirects=True)
+        # Keyed by (view, sort), because those are what change the answer. Scoped to this
+        # client and never written to disk: one command's lifetime is short enough that a
+        # course list cannot go stale within it, which is the property that makes caching
+        # here safe and caching across invocations a correctness question instead.
+        self._course_cache: dict[tuple[str, str], list[Course]] = {}
+        self._site_info: SiteInfo | None = None
 
     def __enter__(self) -> MoodleClient:
         return self
@@ -140,18 +156,77 @@ class MoodleClient:
         """
         return self._call(function, **params)
 
+    @property
+    def supports_batching(self) -> bool:
+        """Whether this campus exposes the mobile app's multi-call endpoint.
+
+        Reading it costs nothing extra in practice: ``get_site_info`` is cached, and any
+        command large enough to want batching makes more than one call anyway.
+        """
+        return BATCH_FUNCTION in self.get_site_info().function_names
+
+    def call_many(self, calls: Sequence[tuple[str, dict[str, Any]]]) -> list[Any]:
+        """Run several calls in one HTTP request, falling back to one request each.
+
+        ``tool_mobile_call_external_functions`` is what the official mobile app uses to
+        avoid a round trip per activity. It is worth reaching for wherever the number of
+        calls grows with the size of a course or an enrolment — a campus-wide sweep over
+        sequential requests is dominated by latency, not by work.
+
+        Results come back in the order asked. A single call that failed raises, exactly as
+        it would have on its own: batching is a transport detail, and a caller must not
+        have to check for errors differently depending on how its request was carried.
+
+        Not every campus exposes the endpoint, and the fallback is a plain loop, so a
+        caller never has to ask whether it is available.
+        """
+        if len(calls) <= 1 or not self.supports_batching:
+            return [self._call(function, **params) for function, params in calls]
+
+        body = self._call(
+            BATCH_FUNCTION,
+            requests=[
+                # Arguments travel as a JSON string here, not as Moodle's usual bracketed
+                # form encoding: the batch endpoint decodes each one itself.
+                {"function": function, "arguments": json.dumps(params)}
+                for function, params in calls
+            ],
+        )
+        responses = body.get("responses") or []
+        if len(responses) != len(calls):
+            raise MoodleError(f"{BATCH_FUNCTION} answered {len(responses)} of {len(calls)} calls")
+        return [
+            _unwrap_batched(response, function)
+            for response, (function, _) in zip(responses, calls, strict=True)
+        ]
+
     # -- endpoints ---------------------------------------------------------------
 
     def get_site_info(self) -> SiteInfo:
-        return SiteInfo.model_validate(self._call("core_webservice_get_site_info"))
+        """Who the token belongs to, and what the campus exposes to it.
+
+        Cached for the life of the client: three separate commands read it to learn the
+        user id alone, and it does not change mid-command.
+        """
+        if self._site_info is None:
+            self._site_info = SiteInfo.model_validate(self._call("core_webservice_get_site_info"))
+        return self._site_info
 
     def list_courses(self, view: str = "all", sort: str = "name") -> list[Course]:
         """List enrolled courses.
 
         ``view`` and ``sort`` take the public names in :data:`VIEWS` and :data:`SORTS`.
+
+        The answer is cached per (view, sort) on this client. A single command routinely
+        asks twice — once through :meth:`resolve_course` to turn a shortname into an id,
+        once to label rows that carry only an id — and reading one quiz's maximum used to
+        re-list every course per quiz.
         """
         classification = _lookup(VIEWS, view, "view")
         sort_value = _lookup(SORTS, sort, "sort")
+        cached = self._course_cache.get((classification, sort_value))
+        if cached is not None:
+            return cached
         body = self._call(
             "core_course_get_enrolled_courses_by_timeline_classification",
             classification=classification,
@@ -159,7 +234,9 @@ class MoodleClient:
             offset=0,
             sort=sort_value,
         )
-        return [Course.model_validate(c) for c in body.get("courses", [])]
+        courses = [Course.model_validate(c) for c in body.get("courses", [])]
+        self._course_cache[(classification, sort_value)] = courses
+        return courses
 
     def get_course_contents(self, course_id: int) -> list[Section]:
         body = self._call("core_course_get_contents", courseid=course_id)
@@ -203,11 +280,16 @@ class MoodleClient:
             return []
 
         body = self._call("mod_forum_get_forums_by_courses", courseids=ids)
-        forums = [Forum.model_validate(f) for f in body]
+        forums = [f for f in (Forum.model_validate(f) for f in body) if f.type == "news"]
+
+        # One call per news forum, which is one per course: over a full enrolment that is
+        # where the time goes, and it is exactly the shape the batch endpoint exists for.
+        bodies = self.call_many(
+            [("mod_forum_get_forum_discussions", {"forumid": forum.id}) for forum in forums]
+        )
 
         announcements: list[Announcement] = []
-        for forum in (f for f in forums if f.type == "news"):
-            discussions = self._call("mod_forum_get_forum_discussions", forumid=forum.id)
+        for forum, discussions in zip(forums, bodies, strict=True):
             check_warnings(discussions, function="mod_forum_get_forum_discussions")
             for discussion in discussions.get("discussions") or []:
                 announcements.append(
@@ -292,6 +374,7 @@ class MoodleClient:
 
         return QuizStatus(
             attempt_count=len(attempts),
+            attempt_ids=[int(a["id"]) for a in attempts if "id" in a],
             last_state=attempts[-1].get("state") if attempts else None,
             has_grade=has_grade,
             grade=grade_body.get("grade"),
@@ -307,6 +390,99 @@ class MoodleClient:
         """
         course_ids = [course_id] if course_id is not None else None
         return next((q.grade for q in self.get_quizzes(course_ids) if q.id == quiz_id), None)
+
+    def get_quiz_attempt_review(self, attempt_id: int, *, page: int = -1) -> AttemptReview:
+        """Read a finished attempt back, with its questions and any visible marks.
+
+        This is the endpoint behind the campus's own "Review" page, and it is read-only:
+        it reports an attempt that is already over and changes nothing. What it returns is
+        governed by the quiz's review options, so the same attempt yields more detail
+        after the quiz closes than while it is open.
+
+        ``page=-1`` asks for every page at once, which is what reading a whole attempt
+        wants; a real page number is for walking one screen at a time.
+
+        Questions arrive as rendered HTML rather than as structured data. That is Moodle's
+        own shape — the official mobile app renders the same markup — so any reader that
+        wants text has to strip it, which :attr:`AttemptQuestion.text` does.
+        """
+        body = self._call("mod_quiz_get_attempt_review", attemptid=attempt_id, page=page)
+        check_warnings(body, function="mod_quiz_get_attempt_review")
+        return AttemptReview.model_validate(body)
+
+    def get_calendar_events(
+        self,
+        *,
+        course_id: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 200,
+    ) -> list[CalendarEvent]:
+        """Dated, actionable items — what is due, and when.
+
+        The one endpoint that answers "what is coming up" for every course in a single
+        call, which is why it does not take a list of course ids: omitting ``course_id``
+        sweeps every enrolment server-side, including courses the dashboard hides.
+
+        ``since`` and ``until`` bound the window as epoch seconds; ``since`` defaults to
+        now, making the default answer "upcoming". Passing ``until=now`` instead is how a
+        caller asks for what is already overdue, since an overdue item's ``timesort`` is
+        in the past.
+
+        Moodle returns these a page at a time and identifies the next page by the last
+        event id seen, not by an offset. Paging here rather than in the caller is what
+        keeps a busy week from being silently cut off at the default of 20.
+        """
+        function = (
+            "core_calendar_get_action_events_by_course"
+            if course_id is not None
+            else "core_calendar_get_action_events_by_timesort"
+        )
+        events: list[CalendarEvent] = []
+        after_event_id = 0
+        timesort_from = int(time.time()) if since is None else since
+        while len(events) < limit:
+            page_size = min(_CALENDAR_PAGE_SIZE, limit - len(events))
+            params: dict[str, Any] = {
+                "timesortfrom": timesort_from,
+                "limitnum": page_size,
+            }
+            if until is not None:
+                params["timesortto"] = until
+            if after_event_id:
+                params["aftereventid"] = after_event_id
+            if course_id is not None:
+                params["courseid"] = course_id
+
+            body = self._call(function, **params)
+            page = [CalendarEvent.model_validate(e) for e in body.get("events") or []]
+            events.extend(page)
+            if len(page) < page_size:
+                break
+            # `lastid` is Moodle's own cursor; falling back to the last event's id keeps
+            # paging working on a response that omits it rather than looping forever.
+            after_event_id = int(body.get("lastid") or page[-1].id)
+        return events
+
+    def get_course_updates(self, course_id: int, since: int) -> list[CourseUpdate]:
+        """What changed in a course's activities since ``since`` (epoch seconds).
+
+        The cheap way to ask "is there anything new": one call per course returns only
+        the activities that moved, where noticing the same thing by diffing course
+        contents means fetching every section, file and description each time.
+
+        Moodle answers with course-module ids and area names, not with activity names or
+        file lists — ``core_course_get_contents`` is what turns an id into something a
+        reader recognises, and the caller joins the two.
+
+        Activities with no changes are dropped rather than returned empty: Moodle lists an
+        instance for every module it checked, so keeping them would report a quiet course
+        as dozens of rows saying nothing happened.
+        """
+        body = self._call("core_course_get_updates_since", courseid=course_id, since=since)
+        check_warnings(body, function="core_course_get_updates_since")
+        updates = [CourseUpdate.model_validate(i) for i in body.get("instances") or []]
+        return [u for u in updates if u.updates]
 
     def get_grade_overview(self) -> list[CourseGrade]:
         """Course-level grade summary across every enrolled course.
@@ -360,6 +536,38 @@ class MoodleClient:
             raise MoodleError(f"No enrolled course matching {reference!r}")
         names = ", ".join(sorted(c.shortname for c in matches))
         raise MoodleError(f"{reference!r} is ambiguous; matches: {names}")
+
+
+def _unwrap_batched(response: dict[str, Any], function: str) -> Any:
+    """One entry of a batched answer, raised or decoded as if it had been sent alone.
+
+    The batch endpoint answers 200 for the request as a whole and reports each call's
+    outcome inside it, with both the data and the exception JSON-encoded as strings. An
+    unread ``error`` flag here is the same failure mode as an unread error body on a
+    single call: a failure that reaches the caller wearing the shape of data.
+    """
+    if response.get("error"):
+        raw = response.get("exception") or "{}"
+        try:
+            detail = json.loads(raw)
+        except ValueError:
+            detail = {}
+        raise MoodleAPIError(
+            errorcode=str(detail.get("errorcode", "unknown")),
+            message=str(detail.get("message") or "Request failed"),
+            function=function,
+        )
+    data = response.get("data")
+    if data is None:
+        return None
+    try:
+        decoded = json.loads(data)
+    except ValueError as exc:
+        raise MoodleError(f"{function} returned a non-JSON response in a batch") from exc
+    # A batched call can still answer with an ordinary error payload rather than by
+    # setting the error flag, so it goes through the same check as an unbatched one.
+    check_api_error(decoded, function=function)
+    return decoded
 
 
 def check_api_error(body: Any, *, function: str | None = None) -> None:

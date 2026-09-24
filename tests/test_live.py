@@ -9,11 +9,13 @@ Requires MOODLE_URL plus either a stored token, MOODLE_TOKEN, or MOODLE_USER/MOO
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
+from moodle_cli.capabilities import evaluate
 from moodle_cli.client import MoodleClient
 from moodle_cli.downloads import download_file, plan_downloads
 from moodle_cli.errors import MoodleAPIError
@@ -165,3 +167,102 @@ def test_get_grade_items_either_succeeds_or_reports_the_known_permission_error(
             assert all(item.label for item in items)
         return
     pytest.skip("no course grade overview to test against")
+
+
+def test_calendar_returns_events_for_a_bounded_window(live_client: MoodleClient) -> None:
+    """The calendar endpoints must stay exposed and keep their paging contract.
+
+    A window a year wide either side, because a quiet fortnight is normal and an empty
+    answer would prove nothing about whether the endpoint still works.
+    """
+    now = int(time.time())
+    year = 365 * 86_400
+    events = live_client.get_calendar_events(since=now - year, until=now + year, limit=60)
+    if not events:
+        pytest.skip("no calendar events in the past or coming year")
+
+    assert all(event.id > 0 for event in events)
+    assert all(event.timesort > 0 for event in events)
+    # timesort is what the calendar orders by, and paging depends on that order holding.
+    assert [e.timesort for e in events] == sorted(e.timesort for e in events)
+
+
+def test_calendar_by_course_is_a_subset_of_the_campus_sweep(live_client: MoodleClient) -> None:
+    """The two functions must agree, or narrowing by course would hide events."""
+    now = int(time.time())
+    year = 365 * 86_400
+    everything = live_client.get_calendar_events(since=now - year, until=now + year, limit=200)
+    with_a_course = [e for e in everything if e.course_id]
+    if not with_a_course:
+        pytest.skip("no course-bound calendar events to compare")
+
+    course_id = with_a_course[0].course_id
+    one_course = live_client.get_calendar_events(
+        course_id=course_id, since=now - year, until=now + year, limit=200
+    )
+
+    assert {e.id for e in one_course} <= {e.id for e in everything}
+    assert all(e.course_id == course_id for e in one_course)
+
+
+def test_course_updates_answers_for_every_course(live_client: MoodleClient) -> None:
+    """core_course_get_updates_since must stay exposed and answer without warnings."""
+    now = int(time.time())
+    checked = False
+    for course in live_client.list_courses(view="all"):
+        updates = live_client.get_course_updates(course.id, since=now - 90 * 86_400)
+        assert all(u.id > 0 for u in updates)
+        assert all(u.updates for u in updates), "an unchanged activity must be dropped"
+        checked = True
+    if not checked:
+        pytest.skip("no enrolled courses")
+
+
+def test_quiz_review_reads_back_a_finished_attempt(live_client: MoodleClient) -> None:
+    """Review options vary, so the contract asserted here is only what always holds."""
+    for quiz in live_client.get_quizzes():
+        status = live_client.get_quiz_status(quiz.id)
+        if not status.attempt_ids:
+            continue
+        try:
+            review = live_client.get_quiz_attempt_review(status.attempt_ids[-1])
+        except MoodleAPIError as exc:
+            # A quiz still open, or one whose review the teacher closed, is a real answer.
+            assert exc.errorcode in {"noreviewattempt", "noreview", "attemptclosed"}
+            return
+        assert all(q.slot > 0 for q in review.questions)
+        assert all(q.number for q in review.questions)
+        # Marks may be hidden, but a question that reports one must report a number.
+        assert all(q.mark_value is not None for q in review.questions if q.mark)
+        return
+    pytest.skip("no attempted quiz to review")
+
+
+def test_the_capability_table_matches_what_the_campus_reports(live_client: MoodleClient) -> None:
+    """Every feature with a command must be one this campus can actually run.
+
+    This is the assertion that fails when a campus turns a function off, which is the
+    thing `auth capabilities` exists to tell a user about — so it should fail loudly here
+    rather than only in their terminal.
+    """
+    available = live_client.get_site_info().function_names
+    assert available, "the campus reported no function list"
+
+    unavailable = [s.feature.name for s in evaluate(available) if s.feature.commands and s.missing]
+    assert not unavailable, f"commands exist for features this campus lacks: {unavailable}"
+
+
+def test_batching_agrees_with_calling_one_at_a_time(live_client: MoodleClient) -> None:
+    """A batched answer must be indistinguishable from the same calls sent separately."""
+    if not live_client.supports_batching:
+        pytest.skip("this campus does not expose tool_mobile_call_external_functions")
+
+    courses = live_client.list_courses(view="all")[:2]
+    if len(courses) < 2:
+        pytest.skip("need two courses to compare a batch against separate calls")
+
+    calls = [("core_course_get_contents", {"courseid": c.id}) for c in courses]
+    batched = live_client.call_many(calls)
+    separately = [live_client.call(function, **params) for function, params in calls]
+
+    assert batched == separately

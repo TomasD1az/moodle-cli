@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -623,3 +624,498 @@ def test_resolve_course_reports_unknown_reference(resolving_client: MoodleClient
 def test_resolve_course_reports_unknown_id(resolving_client: MoodleClient) -> None:
     with pytest.raises(MoodleError, match="id 4242"):
         resolving_client.resolve_course("4242")
+
+
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_calendar_events_defaults_to_upcoming(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """No `since` means "from now", which is what makes the default answer upcoming."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    events = client.get_calendar_events(limit=3)
+
+    assert [e.id for e in events] == [990117, 990118, 990119]
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_calendar_get_action_events_by_timesort"
+    assert int(params["timesortfrom"]) > 0
+    assert "courseid" not in params
+
+
+@respx.mock
+def test_get_calendar_events_switches_function_for_one_course(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """A course is narrowed server-side, not by filtering a campus-wide answer."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    client.get_calendar_events(course_id=101, limit=3)
+
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_calendar_get_action_events_by_course"
+    assert params["courseid"] == "101"
+
+
+@respx.mock
+def test_get_calendar_events_reads_a_site_event_with_no_course(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """A null course, modulename and action must not raise; they mean "none"."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    site_event = next(e for e in client.get_calendar_events(limit=3) if e.id == 990119)
+
+    assert site_event.course is None
+    assert site_event.course_id == 0
+    assert site_event.modulename == ""
+    assert site_event.action_name == ""
+    assert site_event.actionable is False
+
+
+@respx.mock
+def test_get_calendar_events_pages_until_a_short_page(
+    client: MoodleClient, calendar_payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moodle's cursor is the last event id seen, not an offset.
+
+    The page size is shrunk rather than the fixture grown: what is under test is that a
+    full page triggers another request and a short one ends the loop, and that reads the
+    same at two per page as at fifty.
+    """
+    monkeypatch.setattr("moodle_cli.client._CALENDAR_PAGE_SIZE", 2)
+    tick = [1_700_000_000]
+    monkeypatch.setattr(
+        "moodle_cli.client.time.time",
+        lambda: tick.__setitem__(0, tick[0] + 1) or tick[0],
+    )
+    first = {"events": calendar_payload["events"][:2], "lastid": 990118}
+    second = {"events": calendar_payload["events"][2:], "lastid": 990119}
+    route = respx.post(REST_URL).mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=second)]
+    )
+
+    events = client.get_calendar_events(limit=10)
+
+    assert [e.id for e in events] == [990117, 990118, 990119]
+    assert len(route.calls) == 2
+    assert "aftereventid" not in posted_params(route.calls[0].request)
+    assert posted_params(route.calls[1].request)["aftereventid"] == "990118"
+    assert posted_params(route.calls[0].request)["timesortfrom"] == posted_params(
+        route.calls[1].request
+    )["timesortfrom"]
+
+
+@respx.mock
+def test_get_calendar_events_falls_back_to_the_last_event_id(
+    client: MoodleClient, calendar_payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response without `lastid` must still advance, or the loop repeats one page."""
+    monkeypatch.setattr("moodle_cli.client._CALENDAR_PAGE_SIZE", 2)
+    first = {"events": calendar_payload["events"][:2]}
+    second = {"events": calendar_payload["events"][2:]}
+    route = respx.post(REST_URL).mock(
+        side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=second)]
+    )
+
+    client.get_calendar_events(limit=10)
+
+    assert posted_params(route.calls[1].request)["aftereventid"] == "990118"
+
+
+@respx.mock
+def test_get_calendar_events_stops_at_the_limit(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    """The limit is a cap on what is fetched, not a filter applied afterwards."""
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json={"events": calendar_payload["events"][:1]})
+    )
+
+    client.get_calendar_events(limit=1)
+
+    assert len(route.calls) == 1
+    assert posted_params(route.calls[0].request)["limitnum"] == "1"
+
+
+@respx.mock
+def test_get_calendar_events_sends_an_upper_bound_only_when_given(
+    client: MoodleClient, calendar_payload: dict[str, Any]
+) -> None:
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=calendar_payload))
+
+    client.get_calendar_events(since=1_700_000_000, until=1_800_000_000, limit=3)
+
+    params = posted_params(route.calls[0].request)
+    assert params["timesortfrom"] == "1700000000"
+    assert params["timesortto"] == "1800000000"
+
+
+# -- caching ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_list_courses_is_fetched_once_per_view_and_sort(
+    client: MoodleClient, courses_payload: dict[str, Any]
+) -> None:
+    """The repeat that a single command makes costs one request, not two."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=courses_payload))
+
+    client.list_courses(view="all")
+    client.list_courses(view="all")
+    client.resolve_course("IOS460")
+
+    assert len(route.calls) == 2  # "all" once, plus all-including-hidden for resolution
+
+
+@respx.mock
+def test_list_courses_caches_each_view_separately(
+    client: MoodleClient, courses_payload: dict[str, Any]
+) -> None:
+    """A cache keyed on nothing would answer `starred` with the `all` list."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=courses_payload))
+
+    client.list_courses(view="all")
+    client.list_courses(view="starred")
+
+    assert len(route.calls) == 2
+    assert posted_params(route.calls[1].request)["classification"] == "favourites"
+
+
+@respx.mock
+def test_site_info_is_fetched_once(client: MoodleClient) -> None:
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json={"userid": 1, "functions": []})
+    )
+
+    client.get_site_info()
+    client.get_site_info()
+
+    assert len(route.calls) == 1
+
+
+# -- batching --------------------------------------------------------------------
+
+
+@respx.mock
+def test_call_many_sends_one_request_when_the_campus_supports_it(
+    client: MoodleClient,
+) -> None:
+    """The mobile app's multi-call endpoint is what avoids a round trip per activity."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps({"discussions": [{"id": 1}]})},
+                    {"error": False, "data": json.dumps({"discussions": [{"id": 2}]})},
+                ]
+            },
+        )
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    results = client.call_many(
+        [
+            ("mod_forum_get_forum_discussions", {"forumid": 501}),
+            ("mod_forum_get_forum_discussions", {"forumid": 502}),
+        ]
+    )
+
+    assert results == [{"discussions": [{"id": 1}]}, {"discussions": [{"id": 2}]}]
+    batched = [
+        call
+        for call in route.calls
+        if "tool_mobile_call_external_functions" in call.request.content.decode()
+    ]
+    assert len(batched) == 1
+    params = posted_params(batched[0].request)
+    assert json.loads(params["requests[0][arguments]"]) == {"forumid": 501}
+
+
+@respx.mock
+def test_call_many_falls_back_to_one_request_each(client: MoodleClient) -> None:
+    """A campus without the endpoint must still get an answer, not an error."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(200, json={"userid": 1, "functions": []})
+        return httpx.Response(200, json={"discussions": []})
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    results = client.call_many(
+        [
+            ("mod_forum_get_forum_discussions", {"forumid": 501}),
+            ("mod_forum_get_forum_discussions", {"forumid": 502}),
+        ]
+    )
+
+    assert results == [{"discussions": []}, {"discussions": []}]
+    forum_calls = [
+        c for c in route.calls if "mod_forum_get_forum_discussions" in c.request.content.decode()
+    ]
+    assert len(forum_calls) == 2
+
+
+@respx.mock
+def test_call_many_skips_the_capability_check_for_a_single_call(client: MoodleClient) -> None:
+    """One call is never worth a batch, so it must not cost a site-info lookup."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json={"discussions": []}))
+
+    client.call_many([("mod_forum_get_forum_discussions", {"forumid": 501})])
+
+    assert len(route.calls) == 1
+
+
+@respx.mock
+def test_call_many_raises_the_error_one_batched_call_reported(client: MoodleClient) -> None:
+    """A failure inside a batch must raise the way it would have raised on its own."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps({"discussions": []})},
+                    {
+                        "error": True,
+                        "exception": json.dumps(
+                            {"errorcode": "nopermissions", "message": "Denied"}
+                        ),
+                    },
+                ]
+            },
+        )
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    with pytest.raises(MoodleAPIError) as caught:
+        client.call_many(
+            [
+                ("mod_forum_get_forum_discussions", {"forumid": 501}),
+                ("mod_forum_get_forum_discussions", {"forumid": 502}),
+            ]
+        )
+
+    assert caught.value.errorcode == "nopermissions"
+
+
+@respx.mock
+def test_call_many_rejects_a_short_answer(client: MoodleClient) -> None:
+    """Fewer responses than calls would silently pair results with the wrong request."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(200, json={"responses": [{"error": False, "data": "{}"}]})
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    with pytest.raises(MoodleError):
+        client.call_many([("a", {}), ("b", {})])
+
+
+@respx.mock
+def test_get_announcements_batches_one_call_per_news_forum(
+    client: MoodleClient,
+    courses_payload: dict[str, Any],
+    forums_payload: list[dict[str, Any]],
+    discussions_payload: dict[str, Any],
+) -> None:
+    """Announcements cost one call per course; over an enrolment that is the round trips."""
+    second_news_forum = {**forums_payload[0], "id": 503, "course": 102}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        if "core_course_get_enrolled_courses" in body:
+            return httpx.Response(200, json=courses_payload)
+        if "mod_forum_get_forums_by_courses" in body:
+            return httpx.Response(200, json=[*forums_payload, second_news_forum])
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps(discussions_payload)},
+                    {"error": False, "data": json.dumps({"discussions": [], "warnings": []})},
+                ]
+            },
+        )
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    announcements = client.get_announcements()
+
+    assert announcements
+    per_forum = [
+        call
+        for call in route.calls
+        if "wsfunction=mod_forum_get_forum_discussions" in call.request.content.decode()
+    ]
+    assert per_forum == []  # they went inside the batch instead
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_course_updates_drops_activities_that_did_not_change(
+    client: MoodleClient, course_updates_payload: dict[str, Any]
+) -> None:
+    """Moodle lists every module it checked; a quiet one is not news."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=course_updates_payload))
+
+    updates = client.get_course_updates(101, since=1_773_000_000)
+
+    assert [u.id for u in updates] == [2, 5, 4041]
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "core_course_get_updates_since"
+    assert params["courseid"] == "101"
+    assert params["since"] == "1773000000"
+
+
+@respx.mock
+def test_get_course_updates_reports_the_most_recent_area(
+    client: MoodleClient, course_updates_payload: dict[str, Any]
+) -> None:
+    """An activity with two changed areas is dated by the later of the two."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=course_updates_payload))
+
+    first = client.get_course_updates(101, since=1_773_000_000)[0]
+
+    assert first.area_names == ["configuration", "contentfiles"]
+    assert first.latest_epoch == 1773511440
+
+
+@respx.mock
+def test_get_course_updates_raises_on_a_warning(client: MoodleClient) -> None:
+    """A partial answer must not be indistinguishable from a quiet course."""
+    respx.post(REST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "instances": [],
+                "warnings": [{"warningcode": "errorcoursecontentnotavailable", "message": "No"}],
+            },
+        )
+    )
+
+    with pytest.raises(MoodleAPIError):
+        client.get_course_updates(101, since=1_773_000_000)
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_get_quiz_attempt_review_asks_for_every_page(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """page=-1 is what reading a whole attempt wants; a number walks one screen."""
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json=quiz_attempt_review_payload)
+    )
+
+    review = client.get_quiz_attempt_review(883899)
+
+    params = posted_params(route.calls[0].request)
+    assert params["wsfunction"] == "mod_quiz_get_attempt_review"
+    assert params["attemptid"] == "883899"
+    assert params["page"] == "-1"
+    assert review.grade == "6.93"
+    assert review.attempt is not None
+    assert review.attempt.state == "finished"
+
+
+@respx.mock
+def test_get_quiz_attempt_review_reads_a_question_with_no_marks(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """Moodle omits mark and maxmark where the reader may not see them."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=quiz_attempt_review_payload))
+
+    review = client.get_quiz_attempt_review(883899)
+
+    essay = review.questions[2]
+    assert essay.mark is None
+    assert essay.mark_value is None
+    assert essay.maxmark is None
+    assert essay.status == "Pendiente de calificación"
+    assert review.marks_visible is True  # the other two do carry marks
+
+
+@respx.mock
+def test_get_quiz_attempt_review_strips_the_rendered_html(
+    client: MoodleClient, quiz_attempt_review_payload: dict[str, Any]
+) -> None:
+    """Questions arrive as markup; a reader wants the words."""
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json=quiz_attempt_review_payload))
+
+    first = client.get_quiz_attempt_review(883899).questions[0]
+
+    assert "¿Cuál de estas es una estructura de repetición?" in first.text
+    assert "<div" not in first.text
+    assert first.number == "1"
+    assert first.mark_value == 1.0
+
+
+@respx.mock
+def test_get_quiz_attempt_review_raises_on_a_warning(client: MoodleClient) -> None:
+    respx.post(REST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "questions": [],
+                "warnings": [{"warningcode": "noreviewattempt", "message": "Not allowed"}],
+            },
+        )
+    )
+
+    with pytest.raises(MoodleAPIError):
+        client.get_quiz_attempt_review(883899)
+
+
+@respx.mock
+def test_get_quiz_status_reports_the_attempt_ids(
+    client: MoodleClient,
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    """An attempt count with no ids leaves nothing to review."""
+    respx.post(REST_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=quiz_attempts_payload),
+            httpx.Response(200, json=quiz_best_grade_payload),
+            httpx.Response(200, json=quizzes_payload),
+        ]
+    )
+
+    status = client.get_quiz_status(42628)
+
+    assert status.attempt_ids == [883899]

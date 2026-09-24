@@ -12,6 +12,7 @@ Two rules shape every signature here:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -341,6 +342,115 @@ def get_course_announcements(course: str | None = None) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+def get_calendar(
+    course: str | None = None,
+    days: int = 14,
+    overdue: bool = False,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """What is due, across every enrolled course or within one.
+
+    This is the cheapest and broadest deadline view available: one call covers the whole
+    campus and every activity type, where get_assignments and get_quizzes each cover one.
+    Prefer it for "what do I have this week"; use the other two when you need
+    assignment- or quiz-specific fields such as submission status or attempt counts.
+
+    `days` bounds the window and `overdue` flips it: false covers the next `days` days,
+    true covers the `days` days just past, which is where an already-missed deadline is.
+    Both ends are bounded on purpose, so a year-out final exam does not crowd out this
+    week.
+
+    Only activities that publish a deadline to the calendar appear here. A due date a
+    teacher wrote into a page or an announcement does not, so treat this as the floor of
+    what is owed rather than the complete list.
+
+    `due_at` is a full timestamp carrying its UTC offset, because a deadline is a moment
+    and not a day — the same reason it is one in get_assignments.
+
+    `instance_id` is the activity's own id, which is what get_assignment_status and
+    get_quiz_status take; `activity` says which of the two applies.
+    """
+    now = int(time.time())
+    span = days * 86_400
+    since, until = (now - span, now) if overdue else (now, now + span)
+
+    client = open_client()
+    with client:
+        if course:
+            resolved = client.resolve_course(course)
+            course_names = {resolved.id: resolved.shortname}
+            events = client.get_calendar_events(
+                course_id=resolved.id, since=since, until=until, limit=limit
+            )
+        else:
+            events = client.get_calendar_events(since=since, until=until, limit=limit)
+            course_names = _course_names(client) if events else {}
+
+    return [
+        {
+            "id": e.id,
+            "name": e.name,
+            "course": course_names.get(e.course_id, str(e.course_id)),
+            "activity": e.modulename or None,
+            "instance_id": e.instance or None,
+            "due_at": e.sorts_at.isoformat() if e.sorts_at else None,
+            "overdue": e.overdue,
+            "action": e.action_name or None,
+            "actionable": e.actionable,
+            "url": e.url or e.viewurl or None,
+        }
+        for e in events
+    ]
+
+
+@mcp.tool()
+def get_course_updates(course: str, days: int = 7) -> list[dict[str, Any]]:
+    """Which of a course's activities changed in the last `days` days.
+
+    Use this to check for new material instead of re-reading get_course_contents and
+    comparing: Moodle tracks the change itself, so this answers in two calls and returns
+    only what moved.
+
+    `changed` carries Moodle's own area names, untranslated: `contentfiles` is a new or
+    replaced file, `introfiles` an attachment on the description, `configuration` a
+    setting such as a due date, `gradeitems` a change to grading. The set is open-ended
+    and module-specific, so treat an unfamiliar name as "this part of the activity
+    changed" rather than as an error.
+
+    A teacher editing an activity marks it changed whether or not anything visible
+    differs, so this reports movement, not news. To see what the activity now holds, call
+    get_course_contents and read the named activity.
+    """
+    since = int(time.time()) - days * 86_400
+    client = open_client()
+    with client:
+        resolved = client.resolve_course(course)
+        updates = client.get_course_updates(resolved.id, since)
+        module_names = _module_names(client, resolved.id) if updates else {}
+
+    updates.sort(key=lambda u: u.latest_epoch, reverse=True)
+    return [
+        {
+            "cmid": u.id,
+            "activity": module_names.get(u.id),
+            "changed": u.area_names,
+            "changed_at": u.last_updated.isoformat() if u.last_updated else None,
+        }
+        for u in updates
+    ]
+
+
+def _module_names(client: MoodleClient, course_id: int) -> dict[int, str]:
+    """Activity name per course-module id; the updates endpoint answers with ids alone."""
+    names: dict[int, str] = {}
+    for section in client.get_course_contents(course_id):
+        for module in section.modules:
+            is_label = module.modname == "label"
+            names[module.id] = (module.description_text if is_label else module.name) or module.name
+    return names
+
+
+@mcp.tool()
 def get_assignments(course: str | None = None) -> list[dict[str, Any]]:
     """List assignments and their due dates.
 
@@ -456,6 +566,9 @@ def get_quiz_status(quiz_id: int, course: str | None = None) -> dict[str, Any]:
     `max_grade`. A false `grade_available` means the grade cannot be read — the quiz may
     be unattempted, awaiting manual grading, or graded with the marks hidden.
 
+    `attempt_ids` are oldest first; pass one to get_quiz_review to read that attempt's
+    questions and per-question marks back.
+
     Pass the `course` the quiz came from whenever it is known. Reading `max_grade` means
     finding the quiz, and a quiz id alone does not say which course holds it, so without
     this the lookup sweeps every enrolment: checking a course's quizzes one by one pulls
@@ -468,11 +581,63 @@ def get_quiz_status(quiz_id: int, course: str | None = None) -> dict[str, Any]:
 
     return {
         "attempts_used": status.attempt_count,
+        "attempt_ids": status.attempt_ids,
         "last_attempt_state": status.last_state,
         "grade_available": status.has_grade,
         "grade": status.grade,
         "grade_to_pass": status.grade_to_pass,
         "max_grade": status.max_grade,
+    }
+
+
+@mcp.tool()
+def get_quiz_review(attempt_id: int) -> dict[str, Any]:
+    """Read a finished quiz attempt back, with its questions and any visible marks.
+
+    `attempt_id` comes from get_quiz_status's `attempt_ids`. This is the campus's own
+    "Review" page and it is read-only: the attempt is already over and nothing here
+    changes it.
+
+    What comes back is governed by the quiz's review options. The same attempt yields
+    more after the quiz closes than while it is open, and marks can be withheld entirely,
+    so `marks_visible: false` with questions present is a real answer and not a failure.
+    An empty `questions` list means review is not permitted yet.
+
+    Each question's `text` is Moodle's rendered HTML stripped to plain text — the whole
+    question as the browser would draw it, including its options and, where the review
+    options allow it, its feedback. It is one block of prose per question, not structured
+    fields: the API has no structured form of a question to offer.
+
+    `mark` is null where the mark is hidden or the question is still awaiting manual
+    grading, which is not the same as a mark of zero.
+    """
+    client = open_client()
+    with client:
+        review = client.get_quiz_attempt_review(attempt_id)
+
+    return {
+        "attempt_id": attempt_id,
+        "attempt_number": review.attempt.attempt if review.attempt else None,
+        "state": review.attempt.state if review.attempt else None,
+        "finished_at": (
+            review.attempt.finished_at.isoformat()
+            if review.attempt and review.attempt.finished_at
+            else None
+        ),
+        "grade": review.grade,
+        "marks_visible": review.marks_visible,
+        "questions": [
+            {
+                "number": q.number,
+                "type": q.type,
+                "status": q.status or None,
+                "mark": q.mark_value,
+                "max_mark": q.maxmark,
+                "flagged": q.flagged,
+                "text": q.text,
+            }
+            for q in review.questions
+        ],
     }
 
 

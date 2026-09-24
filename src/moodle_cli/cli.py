@@ -5,7 +5,9 @@ from __future__ import annotations
 import functools
 import json
 import textwrap
+import time
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, ParamSpec, TypeVar
@@ -18,6 +20,7 @@ from rich.table import Table
 
 from moodle_cli import __version__ as __version__
 from moodle_cli.auth import TokenStore, mint_token
+from moodle_cli.capabilities import State, evaluate, group_by_component
 from moodle_cli.client import MoodleClient
 from moodle_cli.config import load_config
 from moodle_cli.downloads import (
@@ -33,10 +36,11 @@ from moodle_cli.downloads import (
     plan_link_downloads,
     sanitize,
 )
-from moodle_cli.errors import MoodleError
+from moodle_cli.errors import MoodleAPIError, MoodleError
 from moodle_cli.models import (
     Announcement,
     Assignment,
+    CalendarEvent,
     Participant,
     Section,
     epoch_to_datetime,
@@ -153,7 +157,27 @@ def _format_epoch(value: int, fmt: str = "%Y-%m-%d") -> str:
 
 
 def _plural(count: int, noun: str) -> str:
-    return noun if count == 1 else f"{noun}s"
+    """Pluralise a table's unit noun.
+
+    The -y rule is here because "activity" is the first unit this tool counts that is not
+    regular, and "3 activitys" is the kind of wrong that gets read as a broken command.
+    A consonant before the y is what distinguishes it from "day", which keeps its own.
+    """
+    if count == 1:
+        return noun
+    if noun.endswith("y") and len(noun) > 1 and noun[-2] not in "aeiou":
+        return f"{noun[:-1]}ies"
+    return f"{noun}s"
+
+
+def _format_moment(value: int) -> str:
+    """Render a timestamp to the minute, for a deadline rather than a date.
+
+    Every other table here prints a bare date, which is the right granularity to scan a
+    list of activities. A calendar is the one place where the hour is the whole point: a
+    quiz closing at 23:59 and one closing at 09:00 on the same day are not the same row.
+    """
+    return _format_epoch(value, "%Y-%m-%d %H:%M")
 
 
 def _format_year(value: int) -> str:
@@ -209,6 +233,110 @@ def auth_status() -> None:
     console.print(f"  site: {info.sitename}")
     console.print(f"  functions available: {len(info.function_names)}")
     console.print(f"  file downloads allowed: {info.downloadfiles}")
+
+
+@auth_app.command("capabilities")
+@handle_errors
+def auth_capabilities(
+    all_functions: Annotated[
+        bool,
+        typer.Option("--functions", help="List every function name instead of a per-feature view."),
+    ] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what this campus lets this token do.
+
+    Campuses enable different slices of Moodle's web-service API, so a command failing
+    here is as likely to be a campus setting as a bug. This answers which ones will work
+    before you run them, and names the functions a missing one needs — which is what you
+    would ask a Moodle administrator to enable.
+
+    Features listed with no command are ones this campus supports and this tool does not
+    implement yet.
+    """
+    with open_client(allow_mint=False) as client:
+        info = client.get_site_info()
+
+    available = info.function_names
+    if not available:
+        # A campus can answer get_site_info without a function list. Reporting that as
+        # "nothing works" would be a confident wrong answer; every command below might
+        # still succeed.
+        if as_json:
+            _emit_json(
+                {
+                    "site": info.sitename,
+                    "release": info.release,
+                    "functions_available": 0,
+                    "file_downloads_allowed": info.downloadfiles,
+                    "features": [],
+                    "components": [],
+                    "functions": sorted(available) if all_functions else None,
+                }
+            )
+        else:
+            err_console.print(
+                "[yellow]This campus did not report a function list, so nothing can be "
+                "checked against it.[/yellow]"
+            )
+        return
+
+    statuses = evaluate(available)
+
+    if as_json:
+        _emit_json(
+            {
+                "site": info.sitename,
+                "release": info.release,
+                "functions_available": len(available),
+                "file_downloads_allowed": info.downloadfiles,
+                "features": [
+                    {
+                        "name": s.feature.name,
+                        "state": s.state.value,
+                        "commands": s.feature.commands,
+                        "built": s.feature.built,
+                        "summary": s.feature.summary,
+                        "missing": list(s.missing),
+                    }
+                    for s in statuses
+                ],
+                "components": [
+                    {"component": name, "functions": count}
+                    for name, count in group_by_component(available)
+                ],
+                "functions": sorted(available) if all_functions else None,
+            }
+        )
+        return
+
+    if all_functions:
+        for name in sorted(available):
+            console.print(name)
+        console.print(f"\n{len(available)} functions available to this token")
+        return
+
+    table = Table(title=f"{info.sitename or 'Campus'} — {len(available)} functions available")
+    table.add_column("feature", no_wrap=True)
+    table.add_column("", justify="center", no_wrap=True)
+    table.add_column("command", no_wrap=True, style="dim")
+    table.add_column("needs", ratio=1, overflow="fold", style="dim")
+    for status in statuses:
+        mark = {State.OK: "[green]yes[/green]", State.PARTIAL: "[yellow]part[/yellow]"}.get(
+            status.state, "[red]no[/red]"
+        )
+        if status.feature.commands:
+            where = status.feature.commands
+        else:
+            where = "-- not built yet --" if not status.feature.built else "(automatic)"
+        table.add_row(
+            escape(status.feature.name),
+            mark,
+            escape(where),
+            escape(", ".join(status.missing)),
+        )
+    console.print(table)
+    console.print(f"file downloads allowed: {info.downloadfiles}")
 
 
 @auth_app.command("logout")
@@ -328,6 +456,115 @@ def courses_assignments(as_json: JsonOpt = False) -> None:
     console.print(table)
 
 
+DaysOpt = Annotated[
+    int, typer.Option("--days", min=1, help="How many days of the window to cover.")
+]
+OverdueOpt = Annotated[
+    bool,
+    typer.Option(
+        "--overdue", help="Show the window that has already passed instead of the one ahead."
+    ),
+]
+LimitOpt = Annotated[int, typer.Option("--limit", min=1, help="Maximum events to return.")]
+
+
+def _window_label(days: int, overdue: bool) -> str:
+    """The window in words, named once so both calendar commands phrase it the same."""
+    return f"{'past' if overdue else 'next'} {days} {_plural(days, 'day')}"
+
+
+def _event_window(days: int, overdue: bool) -> tuple[int, int]:
+    """The (since, until) epoch bounds a calendar request covers.
+
+    Both directions are bounded. An unbounded past would reach back to whatever the
+    campus has ever recorded, and an unbounded future returns next year's exam alongside
+    tomorrow's problem set, which is not what "what is due" means to anyone.
+    """
+    now = int(time.time())
+    span = days * 86_400
+    return (now - span, now) if overdue else (now, now + span)
+
+
+def _event_payload(event: CalendarEvent, course: str) -> dict[str, Any]:
+    """One event, with the instant carrying its offset and the course named, not numbered."""
+    return {
+        "id": event.id,
+        "name": event.name,
+        "course": course,
+        "activity": event.modulename or None,
+        "instance_id": event.instance or None,
+        "due_at": event.sorts_at.isoformat() if event.sorts_at else None,
+        "overdue": event.overdue,
+        "action": event.action_name or None,
+        "actionable": event.actionable,
+        "url": event.url or event.viewurl or None,
+    }
+
+
+def _print_events(events: list[CalendarEvent], course_names: dict[int, str], title: str) -> None:
+    """Render events in the calendar's own order, marking the ones already past.
+
+    Only `what` flexes; the rest are fixed and no-wrap, so a narrow terminal ellipsizes
+    the activity name rather than crushing the deadline that identifies the row. The
+    event's action ("Add submission", "Attempt quiz now") is left to --json: it is the
+    longest field by far, `type` already says which activity it belongs to, and keeping
+    it would take the width away from the name.
+    """
+    table = Table(title=title, expand=True)
+    table.add_column("due", justify="left", no_wrap=True)
+    table.add_column("course", no_wrap=True)
+    table.add_column("what", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("type", no_wrap=True, style="dim")
+    for event in events:
+        due = _format_moment(event.timesort)
+        table.add_row(
+            f"[red]{due}[/red]" if event.overdue else due,
+            escape(course_names.get(event.course_id, "-")),
+            escape(event.name),
+            escape(event.modulename or "-"),
+        )
+    console.print(table)
+
+
+@courses_app.command("calendar")
+@handle_errors
+def courses_calendar(
+    days: DaysOpt = 14,
+    overdue: OverdueOpt = False,
+    limit: LimitOpt = 200,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what is due across every enrolled course.
+
+    One call answers for the whole campus, so this is the cheapest view of a week there
+    is — cheaper than listing assignments and quizzes separately, and it covers every
+    activity type rather than those two.
+
+    Only activities that publish a deadline to the calendar appear. A due date a teacher
+    wrote into a page or an announcement is not one of them, so this is the floor of what
+    you owe, not the ceiling.
+
+    Times are printed to the minute, because a deadline is an instant: see "Deadlines are
+    moments" in the README.
+    """
+    since, until = _event_window(days, overdue)
+    with open_client() as client:
+        events = client.get_calendar_events(since=since, until=until, limit=limit)
+        course_names = _course_names(client) if events else {}
+
+    if as_json:
+        _emit_json(
+            [_event_payload(e, course_names.get(e.course_id, str(e.course_id))) for e in events]
+        )
+        return
+
+    window = _window_label(days, overdue)
+    if not events:
+        console.print(f"Nothing due in the {window}.")
+        return
+    _print_events(events, course_names, f"{len(events)} due, {window}")
+
+
 def _by_due_date(assignment: Assignment) -> tuple[bool, int]:
     """Sort undated assignments after dated ones: 0 means "no due date", not "the epoch"."""
     return (assignment.duedate == 0, assignment.duedate)
@@ -352,6 +589,109 @@ def _short_name(fullname: str, shortname: str) -> str:
     if code and fullname.startswith(f"{code} - "):
         return fullname[len(code) + 3 :]
     return fullname
+
+
+@courses_app.command("download")
+@handle_errors
+def courses_download(
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Parent directory. Default: the current one."),
+    ] = None,
+    view: Annotated[View, typer.Option("--view", help="Which courses to include.")] = View.ALL,
+    types: Annotated[
+        list[str] | None,
+        typer.Option("--type", help="Only these module types, e.g. resource. Repeatable."),
+    ] = None,
+    patterns: Annotated[
+        list[str] | None,
+        typer.Option("--match", help="Glob on the filename, e.g. '*.pdf'. Repeatable."),
+    ] = None,
+    links: Annotated[
+        bool,
+        typer.Option(
+            "--links", help="Also fetch Google Slides/Docs/Sheets and Drive-hosted links."
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be downloaded, write nothing.")
+    ] = False,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Re-download files that already exist.")
+    ] = False,
+) -> None:
+    """Download every enrolled course's files into one directory per course.
+
+    The same download as `course download`, swept across your enrolment: each course
+    lands in its own subdirectory named after its shortname, mirroring its sections
+    inside. Re-running is as cheap as it is for one course, since a file already on disk
+    at the expected size is skipped.
+
+    --file and --section are not offered here on purpose: a filename or a section number
+    identifies something inside one course, and asking for it across every course would
+    either fail on the first course that lacks it or silently mean something different in
+    each. Use --type and --match, which describe files rather than positions.
+
+    A course that cannot be read is reported and skipped rather than ending the run; over
+    a whole enrolment, an archived or restricted course is ordinary rather than
+    exceptional.
+    """
+    selectors = _Selectors(
+        modtypes=set(types) if types else None,
+        patterns=patterns or None,
+    )
+    parent = output or Path()
+
+    plans: list[tuple[str, Path, list[PlannedDownload], list[PlannedLink]]] = []
+    with open_client() as client:
+        token = client.token
+        for found in client.list_courses(view=view.value):
+            root = parent / sanitize(found.shortname, fallback=str(found.id))
+            try:
+                contents = client.get_course_contents(found.id)
+            except MoodleAPIError as exc:
+                err_console.print(
+                    f"  [yellow]skip[/yellow] {escape(found.shortname)}: {escape(str(exc))}"
+                )
+                continue
+            planned, planned_links = _plan_course(contents, root, selectors, links=links)
+            if planned or planned_links:
+                plans.append((found.shortname, root, planned, planned_links))
+
+    if not plans:
+        console.print("[yellow]No matching files in any course.[/yellow]")
+        return
+
+    downloaded = skipped = attempted = 0
+    with httpx.Client(timeout=300, follow_redirects=True) as http:
+        for shortname, root, planned, planned_links in plans:
+            _print_course_header(shortname, root, planned, planned_links, links=links)
+            if dry_run:
+                _print_plan(planned, root)
+                if planned_links:
+                    _print_link_plan(planned_links, root)
+                continue
+            attempted += len(planned) + len(planned_links)
+            course_downloaded, course_skipped = _execute_plan(
+                http, token, root, planned, planned_links, overwrite=overwrite
+            )
+            downloaded += course_downloaded
+            skipped += course_skipped
+
+    if dry_run:
+        return
+
+    failed = attempted - downloaded - skipped
+    courses_done = len(plans)
+    summary = (
+        f"\n{downloaded} downloaded, {skipped} already present "
+        f"across {courses_done} {_plural(courses_done, 'course')}"
+    )
+    if failed:
+        summary += f", [red]{failed} failed[/red]"
+    console.print(summary)
+    if failed:
+        raise typer.Exit(1)
 
 
 @courses_app.command("search")
@@ -515,32 +855,19 @@ def course_download(
     zero-file download, so a typo fails loudly. --links only reaches Google-hosted links
     (Slides/Docs/Sheets exports, Drive files, Colab notebooks); other hosts stay listed-only.
     """
+    selectors = _Selectors(
+        sections=set(sections) if sections else None,
+        modtypes=set(types) if types else None,
+        names=set(names) if names else None,
+        patterns=patterns or None,
+    )
     with open_client() as client:
         token = client.token
         resolved = client.resolve_course(course)
         contents = client.get_course_contents(resolved.id)
 
     root = output or Path(sanitize(resolved.shortname, fallback=str(resolved.id)))
-    planned = plan_downloads(
-        contents,
-        root,
-        only_sections=set(sections) if sections else None,
-        only_modtypes=set(types) if types else None,
-        only_names=set(names) if names else None,
-        only_patterns=patterns or None,
-    )
-    planned_links = (
-        plan_link_downloads(
-            contents,
-            root,
-            only_sections=set(sections) if sections else None,
-            only_modtypes=set(types) if types else None,
-            only_names=set(names) if names else None,
-            only_patterns=patterns or None,
-        )
-        if links
-        else []
-    )
+    planned, planned_links = _plan_course(contents, root, selectors, links=links)
 
     if names:
         _reject_unknown_names(names, planned, planned_links, contents, links=links)
@@ -549,11 +876,7 @@ def course_download(
         console.print("[yellow]No matching files.[/yellow]")
         return
 
-    total = sum(p.file.filesize for p in planned)
-    summary_parts = [f"{len(planned)} {_plural(len(planned), 'file')}, {_human_size(total)}"]
-    if links:
-        summary_parts.append(f"{len(planned_links)} {_plural(len(planned_links), 'link')}")
-    console.print(f"[bold]{resolved.shortname}[/bold]: {', '.join(summary_parts)} -> {root}/")
+    _print_course_header(resolved.shortname, root, planned, planned_links, links=links)
 
     if dry_run:
         _print_plan(planned, root)
@@ -561,30 +884,111 @@ def course_download(
             _print_link_plan(planned_links, root)
         return
 
-    downloaded = skipped = 0
     with httpx.Client(timeout=300, follow_redirects=True) as http:
-        for item in planned:
-            fetch = functools.partial(
-                download_file, http, item.file, token, item.destination, overwrite=overwrite
-            )
-            downloaded, skipped = _run_download(root, item.destination, fetch, downloaded, skipped)
+        downloaded, skipped = _execute_plan(
+            http, token, root, planned, planned_links, overwrite=overwrite
+        )
 
-        for link_item in planned_links:
-            fetch = functools.partial(
-                download_link, http, link_item.link, link_item.destination, overwrite=overwrite
-            )
-            downloaded, skipped = _run_download(
-                root, link_item.destination, fetch, downloaded, skipped, label="[dim][link][/dim] "
-            )
-
-    total_planned = len(planned) + len(planned_links)
-    failed = total_planned - downloaded - skipped
+    failed = len(planned) + len(planned_links) - downloaded - skipped
     summary = f"\n{downloaded} downloaded, {skipped} already present"
     if failed:
         summary += f", [red]{failed} failed[/red]"
     console.print(summary)
     if failed:
         raise typer.Exit(1)
+
+
+@dataclass(frozen=True)
+class _Selectors:
+    """The four ways a download can be narrowed, carried as one value.
+
+    They travel together through planning and never apart: passing them as four
+    parameters made every caller restate the same `set(x) if x else None` conversion,
+    which is exactly where a single-course and an all-courses path would drift.
+    """
+
+    sections: set[int] | None = None
+    modtypes: set[str] | None = None
+    names: set[str] | None = None
+    patterns: list[str] | None = None
+
+
+def _plan_course(
+    contents: list[Section],
+    root: Path,
+    selectors: _Selectors,
+    *,
+    links: bool,
+) -> tuple[list[PlannedDownload], list[PlannedLink]]:
+    """What one course's download would fetch, files and Google-hosted links alike."""
+    planned = plan_downloads(
+        contents,
+        root,
+        only_sections=selectors.sections,
+        only_modtypes=selectors.modtypes,
+        only_names=selectors.names,
+        only_patterns=selectors.patterns,
+    )
+    planned_links = (
+        plan_link_downloads(
+            contents,
+            root,
+            only_sections=selectors.sections,
+            only_modtypes=selectors.modtypes,
+            only_names=selectors.names,
+            only_patterns=selectors.patterns,
+        )
+        if links
+        else []
+    )
+    return planned, planned_links
+
+
+def _print_course_header(
+    shortname: str,
+    root: Path,
+    planned: list[PlannedDownload],
+    planned_links: list[PlannedLink],
+    *,
+    links: bool,
+) -> None:
+    total = sum(p.file.filesize for p in planned)
+    parts = [f"{len(planned)} {_plural(len(planned), 'file')}, {_human_size(total)}"]
+    if links:
+        parts.append(f"{len(planned_links)} {_plural(len(planned_links), 'link')}")
+    console.print(f"[bold]{escape(shortname)}[/bold]: {', '.join(parts)} -> {root}/")
+
+
+def _execute_plan(
+    http: httpx.Client,
+    token: str,
+    root: Path,
+    planned: list[PlannedDownload],
+    planned_links: list[PlannedLink],
+    *,
+    overwrite: bool,
+) -> tuple[int, int]:
+    """Fetch a planned course, returning (downloaded, already present).
+
+    Failures are reported as they happen and counted by difference rather than returned:
+    a caller needs the total to decide its exit code, and one course failing must not
+    stop the next one in an all-courses run.
+    """
+    downloaded = skipped = 0
+    for item in planned:
+        fetch = functools.partial(
+            download_file, http, item.file, token, item.destination, overwrite=overwrite
+        )
+        downloaded, skipped = _run_download(root, item.destination, fetch, downloaded, skipped)
+
+    for link_item in planned_links:
+        fetch = functools.partial(
+            download_link, http, link_item.link, link_item.destination, overwrite=overwrite
+        )
+        downloaded, skipped = _run_download(
+            root, link_item.destination, fetch, downloaded, skipped, label="[dim][link][/dim] "
+        )
+    return downloaded, skipped
 
 
 def _run_download(
@@ -770,6 +1174,123 @@ def _announcement_payload(announcement: Announcement, course: str) -> dict[str, 
     }
 
 
+@course_app.command("calendar")
+@handle_errors
+def course_calendar(
+    course: CourseArg,
+    days: DaysOpt = 14,
+    overdue: OverdueOpt = False,
+    limit: LimitOpt = 200,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what is due in one course.
+
+    The same view as `courses calendar`, narrowed server-side rather than by filtering a
+    campus-wide answer, so a course with a busy week is not crowded out of the limit by
+    the rest of your enrolment.
+    """
+    since, until = _event_window(days, overdue)
+    with open_client() as client:
+        found = client.resolve_course(course)
+        events = client.get_calendar_events(
+            course_id=found.id, since=since, until=until, limit=limit
+        )
+
+    if as_json:
+        _emit_json([_event_payload(e, found.shortname) for e in events])
+        return
+
+    window = _window_label(days, overdue)
+    if not events:
+        console.print(f"Nothing due in {found.shortname} in the {window}.")
+        return
+    _print_events(
+        events, {found.id: found.shortname}, f"{found.shortname}: {len(events)} due, {window}"
+    )
+
+
+@course_app.command("updates")
+@handle_errors
+def course_updates(
+    course: CourseArg,
+    days: DaysOpt = 7,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show which of a course's activities changed recently.
+
+    Answers "is there anything new" in two calls rather than by re-reading the whole
+    course and comparing: Moodle tracks the change itself and reports only the activities
+    that moved. The second call is `course contents`, which is what turns the
+    course-module ids it answers with into activity names.
+
+    The areas are Moodle's own and are reported unchanged: `contentfiles` is a new or
+    replaced file, `introfiles` an attachment on the description, `configuration` a
+    setting such as a due date, `gradeitems` a change to how it is graded.
+
+    A teacher editing an activity updates it whether or not anything you can see changed,
+    so this reports movement rather than news.
+    """
+    since = int(time.time()) - days * 86_400
+    with open_client() as client:
+        resolved = client.resolve_course(course)
+        updates = client.get_course_updates(resolved.id, since)
+        # Only worth a second round trip when something actually changed.
+        module_names = _module_names(client, resolved.id) if updates else {}
+
+    updates.sort(key=lambda u: u.latest_epoch, reverse=True)
+
+    if as_json:
+        _emit_json(
+            [
+                {
+                    "cmid": u.id,
+                    "activity": module_names.get(u.id),
+                    "changed": u.area_names,
+                    "changed_at": u.last_updated.isoformat() if u.last_updated else None,
+                }
+                for u in updates
+            ]
+        )
+        return
+
+    window = _window_label(days, overdue=True)
+    if not updates:
+        console.print(f"Nothing changed in {escape(resolved.shortname)} in the {window}.")
+        return
+
+    count = len(updates)
+    table = Table(
+        title=f"{resolved.shortname}: {count} {_plural(count, 'activity')} changed, {window}",
+        expand=True,
+    )
+    table.add_column("changed", no_wrap=True)
+    table.add_column("activity", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("what", ratio=1, min_width=16, overflow="fold", style="dim")
+    for update in updates:
+        moment = update.last_updated
+        table.add_row(
+            moment.strftime("%Y-%m-%d %H:%M") if moment else "-",
+            escape(module_names.get(update.id) or f"cmid {update.id}"),
+            escape(", ".join(update.area_names) or "-"),
+        )
+    console.print(table)
+
+
+def _module_names(client: MoodleClient, course_id: int) -> dict[int, str]:
+    """Activity name per course-module id.
+
+    The updates endpoint answers with ids alone, and a course-module id means nothing to
+    a reader. A label carries its text in the description rather than the name, the same
+    way `course contents` reads it.
+    """
+    names: dict[int, str] = {}
+    for section in client.get_course_contents(course_id):
+        for module in section.modules:
+            is_label = module.modname == "label"
+            names[module.id] = (module.description_text if is_label else module.name) or module.name
+    return names
+
+
 @course_app.command("assignments")
 @handle_errors
 def course_assignments(course: CourseArg, as_json: JsonOpt = False) -> None:
@@ -900,6 +1421,9 @@ def course_quiz_status(
     console.print(f"attempts used: {status.attempt_count}")
     if status.last_state:
         console.print(f"last attempt: {status.last_state}")
+    if status.attempt_ids:
+        ids = ", ".join(str(i) for i in status.attempt_ids)
+        console.print(f"attempt ids: {ids}  [dim](for `course quiz-review`)[/dim]")
     if status.has_grade:
         # The grade arrives already scaled to the quiz maximum, so it reads as a
         # proportion only next to that maximum.
@@ -910,6 +1434,88 @@ def course_quiz_status(
         # One flag covers never attempted, awaiting manual grading, and graded with the
         # marks hidden by the quiz's review options — so report availability, not grading.
         console.print("grade: not available (not graded yet, or hidden by the quiz)")
+
+
+@course_app.command("quiz-review")
+@handle_errors
+def course_quiz_review(
+    attempt_id: Annotated[
+        int, typer.Argument(help="Attempt id, as shown by `course quiz-status`.")
+    ],
+    questions: Annotated[
+        bool, typer.Option("--questions", help="Print each question's full text.")
+    ] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Read a finished quiz attempt back, with its questions and any visible marks.
+
+    This is the campus's own "Review" page, read from the command line. It is read-only:
+    the attempt is already over and nothing here changes it.
+
+    What comes back is governed by the quiz's review options, which the teacher sets. The
+    same attempt yields more after the quiz closes than while it is still open, and marks
+    can be withheld entirely — an attempt with questions and no marks is a real answer,
+    not a failure.
+
+    Moodle returns each question as rendered HTML, so `--questions` prints it stripped to
+    text. Expect the wording, the options and — where the review options allow it — the
+    feedback, laid out as one block per question rather than as structured fields.
+    """
+    with open_client() as client:
+        review = client.get_quiz_attempt_review(attempt_id)
+
+    if as_json:
+        _emit_json(
+            {
+                "attempt_id": attempt_id,
+                "state": review.attempt.state if review.attempt else None,
+                "grade": review.grade,
+                "marks_visible": review.marks_visible,
+                "questions": [
+                    {
+                        "number": q.number,
+                        "type": q.type,
+                        "status": q.status,
+                        "mark": q.mark_value,
+                        "max_mark": q.maxmark,
+                        "flagged": q.flagged,
+                        "text": q.text,
+                    }
+                    for q in review.questions
+                ],
+            }
+        )
+        return
+
+    attempt = review.attempt
+    if attempt:
+        finished = _format_moment(attempt.timefinish) if attempt.timefinish else "-"
+        console.print(f"attempt {attempt.attempt} ({attempt.state}), finished {finished}")
+    if review.grade is not None:
+        console.print(f"grade: {review.grade}")
+    if not review.questions:
+        console.print("[yellow]No questions returned; the quiz may not allow review yet.[/yellow]")
+        return
+    if not review.marks_visible:
+        console.print("[yellow]Marks are hidden by this quiz's review options.[/yellow]")
+
+    count = len(review.questions)
+    table = Table(title=f"{count} {_plural(count, 'question')}", expand=True)
+    table.add_column("#", justify="right", no_wrap=True, style="dim")
+    table.add_column("type", no_wrap=True, style="dim")
+    table.add_column("status", ratio=1, min_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("mark", justify="right", no_wrap=True)
+    for question in review.questions:
+        mark = question.mark_value
+        out_of = question.maxmark
+        cell = "-" if mark is None else f"{mark:g}" + (f" / {out_of:g}" if out_of else "")
+        table.add_row(question.number, question.type, escape(question.status or "-"), cell)
+    console.print(table)
+
+    if questions:
+        for question in review.questions:
+            console.print(f"\n[bold cyan]{question.number}.[/bold cyan] [dim]{question.type}[/dim]")
+            _print_block("   ", 3, question.text)
 
 
 @course_app.command("grades")

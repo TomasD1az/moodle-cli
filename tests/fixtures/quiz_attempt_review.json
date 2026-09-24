@@ -1,0 +1,80 @@
+{
+  "grade": "6.93",
+  "attempt": {
+    "id": 883899,
+    "quiz": 42628,
+    "userid": 63643,
+    "attempt": 1,
+    "currentpage": 0,
+    "preview": 0,
+    "state": "finished",
+    "timestart": 1773848006,
+    "timefinish": 1773848169,
+    "timemodified": 1773848169,
+    "sumgrades": 6.925
+  },
+  "additionaldata": [
+    {
+      "id": "feedback",
+      "title": "Comentario",
+      "content": "Buen trabajo con las estructuras de control."
+    }
+  ],
+  "questions": [
+    {
+      "slot": 1,
+      "type": "multichoice",
+      "page": 0,
+      "questionnumber": "1",
+      "number": 1,
+      "html": "<div class=\"que multichoice\"><div class=\"qtext\"><p>¿Cuál de estas es una estructura de repetición?</p></div><div class=\"answer\"><div>a. <span>if</span></div><div>b. <span>while</span></div></div><div class=\"feedback\"><p>La respuesta correcta es: while</p></div></div>",
+      "sequencecheck": 2,
+      "lastactiontime": 1773848100,
+      "hasautosavedstep": false,
+      "flagged": false,
+      "status": "Correcta",
+      "state": "gradedright",
+      "blockedbyprevious": false,
+      "mark": "1.00",
+      "maxmark": 1,
+      "settings": null,
+      "responsefileareas": []
+    },
+    {
+      "slot": 2,
+      "type": "shortanswer",
+      "page": 0,
+      "questionnumber": "2",
+      "number": 2,
+      "html": "<div class=\"que shortanswer\"><div class=\"qtext\"><p>Nombre el operador de asignación en Python.</p></div></div>",
+      "sequencecheck": 2,
+      "lastactiontime": 1773848150,
+      "hasautosavedstep": false,
+      "flagged": true,
+      "status": "Incorrecta",
+      "state": "gradedwrong",
+      "blockedbyprevious": false,
+      "mark": "0.00",
+      "maxmark": 1,
+      "settings": null,
+      "responsefileareas": []
+    },
+    {
+      "slot": 3,
+      "type": "essay",
+      "page": 1,
+      "questionnumber": "3",
+      "number": 3,
+      "html": "<div class=\"que essay\"><div class=\"qtext\"><p>Explique la diferencia entre una lista y una tupla.</p></div></div>",
+      "sequencecheck": 2,
+      "lastactiontime": 1773848160,
+      "hasautosavedstep": false,
+      "flagged": false,
+      "status": "Pendiente de calificación",
+      "blockedbyprevious": false,
+      "settings": null,
+      "responsefileareas": []
+    }
+  ],
+  "warnings": []
+}

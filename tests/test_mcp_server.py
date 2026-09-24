@@ -21,10 +21,13 @@ from moodle_cli.errors import MoodleAPIError
 from moodle_cli.mcp_server import (
     get_assignment_status,
     get_assignments,
+    get_calendar,
     get_course_announcements,
     get_course_contents,
+    get_course_updates,
     get_grade_summary,
     get_grades,
+    get_quiz_review,
     get_quiz_status,
     get_quizzes,
     list_courses,
@@ -463,6 +466,7 @@ def test_get_quiz_status_reports_attempts_and_grade(
 
     assert result == {
         "attempts_used": 1,
+        "attempt_ids": [883899],
         "last_attempt_state": "finished",
         "grade_available": True,
         "grade": 6.925,
@@ -584,3 +588,176 @@ def test_get_grades_surfaces_the_permission_error_instead_of_hiding_it(
 
     with pytest.raises(MoodleAPIError, match="nopermissiontoviewgrades"):
         get_grades("IOS460")
+
+
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_calendar_names_courses_and_keeps_the_offset(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    results = get_calendar()
+
+    assert results[0] == {
+        "id": 990117,
+        "name": "Actividad semana 2 se cierra",
+        "course": "IOS460 - 123246",
+        "activity": "quiz",
+        "instance_id": 42628,
+        "due_at": _local_iso(1773954000),
+        "overdue": False,
+        "action": "Intente resolver el cuestionario ahora",
+        "actionable": True,
+        "url": "https://campus.example.edu/mod/quiz/view.php?id=866948",
+    }
+
+
+@respx.mock
+def test_get_calendar_reports_a_site_event_as_belonging_to_no_activity(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """Null course, modulename and action become null, not "0" and not "" ."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    site_event = next(e for e in get_calendar() if e["id"] == 990119)
+
+    assert site_event["activity"] is None
+    assert site_event["instance_id"] is None
+    assert site_event["action"] is None
+    assert site_event["actionable"] is False
+    assert site_event["course"] == "0"
+
+
+@respx.mock
+def test_get_calendar_narrows_one_course_server_side(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_calendar_get_action_events_by_course=calendar_payload,
+    )
+
+    get_calendar("IOS460")
+
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert any("core_calendar_get_action_events_by_course" in body for body in bodies)
+    assert not any("core_calendar_get_action_events_by_timesort" in body for body in bodies)
+
+
+@respx.mock
+def test_get_calendar_overdue_looks_backwards(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """Overdue is the same query with the window flipped, not a filter on the result."""
+    route = route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    get_calendar(overdue=True, days=7)
+
+    body = route.calls[0].request.content.decode()
+    params = dict(pair.split("=", 1) for pair in body.split("&") if "=" in pair)
+    assert int(params["timesortto"]) - int(params["timesortfrom"]) == 7 * 86_400
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_course_updates_names_activities_and_orders_newest_first(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    results = get_course_updates("IOS460")
+
+    assert results[0] == {
+        "cmid": 2,
+        "activity": "Programa de la materia",
+        "changed": ["configuration", "contentfiles"],
+        "changed_at": _local_iso(1773511440),
+    }
+    assert [row["cmid"] for row in results] == [2, 5, 4041]
+    assert results[2]["activity"] is None
+
+
+@respx.mock
+def test_get_course_updates_returns_nothing_for_a_quiet_course(
+    courses_payload: dict[str, Any],
+) -> None:
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since={"instances": [], "warnings": []},
+    )
+
+    assert get_course_updates("IOS460") == []
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert not any("core_course_get_contents" in body for body in bodies)
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_get_quiz_review_returns_questions_as_text(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    review = get_quiz_review(883899)
+
+    assert review["attempt_number"] == 1
+    assert review["state"] == "finished"
+    assert review["grade"] == "6.93"
+    assert review["marks_visible"] is True
+    assert review["finished_at"] == _local_iso(1773848169)
+    first = review["questions"][0]
+    assert first["type"] == "multichoice"
+    assert first["mark"] == 1.0
+    assert "estructura de repetición" in first["text"]
+    assert "<div" not in first["text"]
+
+
+@respx.mock
+def test_get_quiz_review_reports_an_ungraded_question_as_null_not_zero(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """A mark awaiting manual grading is absent, which is not a mark of zero."""
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    essay = get_quiz_review(883899)["questions"][2]
+
+    assert essay["mark"] is None
+    assert essay["max_mark"] is None
+    assert essay["status"] == "Pendiente de calificación"
+
+
+@respx.mock
+def test_get_quiz_status_offers_attempt_ids_to_review(
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        mod_quiz_get_user_attempts=quiz_attempts_payload,
+        mod_quiz_get_user_best_grade=quiz_best_grade_payload,
+        mod_quiz_get_quizzes_by_courses=quizzes_payload,
+    )
+
+    assert get_quiz_status(42628)["attempt_ids"] == [883899]

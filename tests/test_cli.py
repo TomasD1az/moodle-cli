@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from typing import Any
@@ -863,6 +864,7 @@ CORE_COMMANDS_WITHOUT_JSON = {
     ("auth", "status"),
     ("auth", "logout"),
     ("course", "download"),
+    ("courses", "download"),
 }
 
 CORE_GROUPS = ("auth", "courses", "course", "plugins")
@@ -887,3 +889,553 @@ def test_only_the_documented_commands_lack_json_output() -> None:
                 missing.add((group_name, command_name))
 
     assert missing == CORE_COMMANDS_WITHOUT_JSON
+
+
+# -- calendar --------------------------------------------------------------------
+
+
+@respx.mock
+def test_courses_calendar_renders_deadlines_with_their_hour(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """A calendar prints the minute; every other table here prints the day."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Actividad semana 2" in result.output
+    assert "2026-03-19 18:00" in result.output
+    assert "IOS460 - 123246" in result.output
+    assert "next 14 days" in result.output
+
+
+@respx.mock
+def test_courses_calendar_labels_a_site_event_with_no_course(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """An event belonging to no course must render, not crash on a missing shortname."""
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Charla" in result.output
+
+
+@respx.mock
+def test_courses_calendar_overdue_asks_for_the_window_already_passed(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route = route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar", "--overdue", "--days", "7"])
+
+    assert result.exit_code == 0
+    assert "past 7 days" in result.output
+    params = {
+        k: v
+        for k, v in (
+            pair.split("=", 1)
+            for pair in route.calls[0].request.content.decode().split("&")
+            if "=" in pair
+        )
+    }
+    assert int(params["timesortto"]) >= int(params["timesortfrom"])
+
+
+@respx.mock
+def test_courses_calendar_json_names_the_course_and_keeps_the_offset(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort=calendar_payload,
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    quiz_event = next(e for e in data if e["id"] == 990117)
+    assert quiz_event["course"] == "IOS460 - 123246"
+    assert quiz_event["activity"] == "quiz"
+    assert quiz_event["instance_id"] == 42628
+    assert quiz_event["due_at"] == epoch_to_datetime(1773954000).isoformat()  # type: ignore[union-attr]
+    assert data[1]["overdue"] is True
+    assert data[1]["actionable"] is False
+    site_event = next(e for e in data if e["id"] == 990119)
+    assert site_event["activity"] is None
+    assert site_event["instance_id"] is None
+    assert site_event["action"] is None
+
+
+@respx.mock
+def test_courses_calendar_reports_an_empty_window_plainly(
+    courses_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_calendar_get_action_events_by_timesort={"events": []},
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "calendar"])
+
+    assert result.exit_code == 0
+    assert "Nothing due" in result.output
+
+
+@respx.mock
+def test_course_calendar_narrows_server_side(
+    courses_payload: dict[str, Any], calendar_payload: dict[str, Any]
+) -> None:
+    """One course goes through the by-course function, not a filtered campus sweep."""
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_calendar_get_action_events_by_course=calendar_payload,
+    )
+
+    result = runner.invoke(app, ["course", "calendar", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "IOS460 - 123246" in result.output
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert any(
+        "core_calendar_get_action_events_by_course" in body and "courseid=101" in body
+        for body in bodies
+    )
+
+
+@respx.mock
+def test_course_calendar_rejects_a_zero_day_window(courses_payload: dict[str, Any]) -> None:
+    """`--days 0` is a window with no width, which Typer rejects before any request."""
+    route_by_function(core_course_get_enrolled_courses_by_timeline_classification=courses_payload)
+
+    result = runner.invoke(app, ["course", "calendar", "IOS460", "--days", "0"])
+
+    assert result.exit_code == 2
+
+
+# -- capabilities ----------------------------------------------------------------
+
+
+@respx.mock
+def test_auth_capabilities_marks_features_the_campus_supports() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "sitename": "Example University",
+            "userid": 1,
+            "downloadfiles": True,
+            "functions": [
+                {"name": "core_course_get_enrolled_courses_by_timeline_classification"},
+                {"name": "core_course_get_contents"},
+                {"name": "mod_quiz_get_quizzes_by_courses"},
+            ],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities"])
+
+    assert result.exit_code == 0
+    assert "courses" in result.output
+    assert "quizzes" in result.output
+    assert "Example University" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_json_names_what_is_missing() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "sitename": "Example University",
+            "userid": 1,
+            "functions": [
+                {"name": "core_course_get_contents"},
+                {"name": "mod_quiz_get_quizzes_by_courses"},
+            ],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    features = {f["name"]: f for f in data["features"]}
+    assert features["contents"]["state"] == "ok"
+    assert features["quizzes"]["state"] == "partial"
+    assert "mod_quiz_get_user_attempts" in features["quizzes"]["missing"]
+    assert features["calendar"]["state"] == "unavailable"
+    assert data["functions_available"] == 2
+
+
+@respx.mock
+def test_auth_capabilities_does_not_claim_failure_on_an_empty_function_list() -> None:
+    """An empty list means the campus said nothing, not that nothing works."""
+    route_by_function(core_webservice_get_site_info={"userid": 1, "functions": []})
+
+    result = runner.invoke(app, ["auth", "capabilities"])
+
+    assert result.exit_code == 0
+    assert "did not report a function list" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_json_treats_an_empty_function_list_as_unknown() -> None:
+    route_by_function(core_webservice_get_site_info={"userid": 1, "functions": []})
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["functions_available"] == 0
+    assert data["features"] == []
+    assert data["components"] == []
+
+
+@respx.mock
+def test_auth_capabilities_can_list_raw_function_names() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "userid": 1,
+            "functions": [{"name": "core_course_get_contents"}],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--functions"])
+
+    assert result.exit_code == 0
+    assert "core_course_get_contents" in result.output
+    assert "1 functions available" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_distinguishes_automatic_features_from_unbuilt_ones() -> None:
+    """A feature with no command is not necessarily missing work."""
+    route_by_function(
+        core_webservice_get_site_info={
+            "userid": 1,
+            "functions": [{"name": "tool_mobile_call_external_functions"}],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    features = {f["name"]: f for f in json.loads(result.stdout)["features"]}
+    assert features["batching"] == {
+        "name": "batching",
+        "state": "ok",
+        "commands": "",
+        "built": True,
+        "summary": "Several calls in one request, used automatically where it helps.",
+        "missing": [],
+    }
+    assert features["quiz attempts"]["built"] is False
+
+
+# -- downloading every course ----------------------------------------------------
+
+
+@respx.mock
+def test_courses_download_makes_one_directory_per_course(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    """Every enrolled course is swept, each into a subdirectory of its own."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+    respx.get(url__startswith=f"{BASE_URL}/webservice/pluginfile.php").mock(
+        side_effect=lambda request: httpx.Response(200, content=b"x" * _expected_size(request))
+    )
+
+    result = runner.invoke(app, ["courses", "download", "--type", "resource"])
+
+    assert result.exit_code == 0
+    directories = sorted(p.name for p in tmp_cwd.iterdir() if p.is_dir())
+    assert directories == ["I310 - 106934", "I312 - 106931", "IOS460 - 123246"]
+    assert "across 3 courses" in result.stdout
+
+
+@respx.mock
+def test_courses_download_honours_an_output_parent(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "download", "-o", "campus", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "campus/IOS460 - 123246" in result.stdout.replace("\\", "/")
+    assert list(tmp_cwd.iterdir()) == []
+
+
+@respx.mock
+def test_courses_download_skips_a_course_it_cannot_read(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    """One unreadable course must not end a sweep of the whole enrolment."""
+    answers = itertools.chain(
+        [httpx.Response(200, json={"errorcode": "nopermissions", "message": "Denied"})],
+        itertools.repeat(httpx.Response(200, json=contents_payload)),
+    )
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_course_get_contents" in body:
+            return next(answers)
+        return httpx.Response(200, json=courses_payload)
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    result = runner.invoke(app, ["courses", "download", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "skip" in result.output
+    assert "IOS460 - 123246" not in result.stdout
+    assert "I312 - 106931" in result.stdout
+
+
+@respx.mock
+def test_courses_download_reports_an_empty_sweep(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "download", "--match", "*.nothing"])
+
+    assert result.exit_code == 0
+    assert "No matching files in any course" in result.stdout
+
+
+@pytest.mark.parametrize("flag", ["--file", "--section"])
+def test_courses_download_rejects_per_course_selectors(flag: str) -> None:
+    """A filename or a section number identifies something inside one course only."""
+    result = runner.invoke(app, ["courses", "download", flag, "1"])
+
+    assert result.exit_code == 2
+
+
+# -- updates ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_course_updates_names_activities_from_the_contents(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    """The endpoint answers with course-module ids; the names come from the contents."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "Programa de la materia" in result.output
+    assert "contentfiles" in result.output
+    assert "2 activities changed" not in result.output  # three changed, one was quiet
+    assert "3 activities changed" in result.output
+
+
+@respx.mock
+def test_course_updates_falls_back_to_the_cmid_when_unnamed(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    """An activity can change and still not appear in the contents you may read."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "cmid 4041" in result.output
+
+
+@respx.mock
+def test_course_updates_skips_the_contents_call_when_nothing_changed(
+    courses_payload: dict[str, Any],
+) -> None:
+    """A quiet course costs one call, not two."""
+    route = route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since={"instances": [], "warnings": []},
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460"])
+
+    assert result.exit_code == 0
+    assert "Nothing changed" in result.output
+    bodies = [call.request.content.decode() for call in route.calls]
+    assert not any("core_course_get_contents" in body for body in bodies)
+
+
+@respx.mock
+def test_course_updates_json_orders_newest_first(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    course_updates_payload: dict[str, Any],
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_updates_since=course_updates_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["course", "updates", "IOS460", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert [row["cmid"] for row in data] == [2, 5, 4041]
+    assert data[0]["activity"] == "Programa de la materia"
+    assert data[0]["changed"] == ["configuration", "contentfiles"]
+    assert data[0]["changed_at"] == epoch_to_datetime(1773511440).isoformat()  # type: ignore[union-attr]
+    assert data[2]["activity"] is None
+
+
+@pytest.mark.parametrize(
+    ("count", "noun", "expected"),
+    [
+        (1, "course", "course"),
+        (2, "course", "courses"),
+        (2, "day", "days"),
+        (1, "activity", "activity"),
+        (3, "activity", "activities"),
+    ],
+)
+def test_plural_handles_the_units_this_tool_counts(count: int, noun: str, expected: str) -> None:
+    """ "3 activitys" reads as a broken command rather than as a count."""
+    from moodle_cli.cli import _plural
+
+    assert _plural(count, noun) == expected
+
+
+# -- quiz review -----------------------------------------------------------------
+
+
+@respx.mock
+def test_quiz_review_lists_questions_with_their_marks(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "attempt 1 (finished)" in result.output
+    assert "grade: 6.93" in result.output
+    assert "multichoice" in result.output
+    assert "1 / 1" in result.output
+    assert "3 questions" in result.output
+
+
+@respx.mock
+def test_quiz_review_prints_question_text_only_when_asked(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """The rendered HTML is long; the table stays scannable without it."""
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    without = runner.invoke(app, ["course", "quiz-review", "883899"])
+    with_text = runner.invoke(app, ["course", "quiz-review", "883899", "--questions"])
+
+    assert "estructura de repetición" not in without.output
+    assert "estructura de repetición" in with_text.output
+    assert "<div" not in with_text.output
+
+
+@respx.mock
+def test_quiz_review_says_so_when_review_is_not_permitted(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """No questions is a review option, not a failure."""
+    route_by_function(mod_quiz_get_attempt_review={**quiz_attempt_review_payload, "questions": []})
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "may not allow review yet" in result.output
+
+
+@respx.mock
+def test_quiz_review_warns_when_marks_are_hidden(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    """An attempt with questions and no marks is a real state."""
+    hidden = [
+        {k: v for k, v in q.items() if k not in {"mark", "maxmark"}}
+        for q in quiz_attempt_review_payload["questions"]
+    ]
+    route_by_function(
+        mod_quiz_get_attempt_review={**quiz_attempt_review_payload, "questions": hidden}
+    )
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899"])
+
+    assert result.exit_code == 0
+    assert "Marks are hidden" in result.output
+
+
+@respx.mock
+def test_quiz_review_json_reports_an_ungraded_question_as_null(
+    quiz_attempt_review_payload: dict[str, Any],
+) -> None:
+    route_by_function(mod_quiz_get_attempt_review=quiz_attempt_review_payload)
+
+    result = runner.invoke(app, ["course", "quiz-review", "883899", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["state"] == "finished"
+    assert data["questions"][0]["mark"] == 1.0
+    assert data["questions"][1]["flagged"] is True
+    assert data["questions"][2]["mark"] is None
+
+
+@respx.mock
+def test_quiz_status_points_at_the_attempt_ids(
+    quiz_attempts_payload: dict[str, Any],
+    quiz_best_grade_payload: dict[str, Any],
+    quizzes_payload: dict[str, Any],
+) -> None:
+    """An attempt count with no ids leaves nothing to review."""
+    route_by_function(
+        mod_quiz_get_user_attempts=quiz_attempts_payload,
+        mod_quiz_get_user_best_grade=quiz_best_grade_payload,
+        mod_quiz_get_quizzes_by_courses=quizzes_payload,
+    )
+
+    result = runner.invoke(app, ["course", "quiz-status", "42628"])
+
+    assert result.exit_code == 0
+    assert "attempt ids: 883899" in result.output

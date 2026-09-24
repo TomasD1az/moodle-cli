@@ -1,0 +1,28 @@
+{
+  "instances": [
+    {
+      "contextlevel": "module",
+      "id": 2,
+      "updates": [
+        {"name": "configuration", "timeupdated": 1773425040},
+        {"name": "contentfiles", "timeupdated": 1773511440, "itemids": [55123, 55124]}
+      ]
+    },
+    {
+      "contextlevel": "module",
+      "id": 5,
+      "updates": [{"name": "gradeitems", "timeupdated": 1773338640}]
+    },
+    {
+      "contextlevel": "module",
+      "id": 4041,
+      "updates": [{"name": "configuration", "timeupdated": 1773300000}]
+    },
+    {
+      "contextlevel": "module",
+      "id": 3,
+      "updates": []
+    }
+  ],
+  "warnings": []
+}
