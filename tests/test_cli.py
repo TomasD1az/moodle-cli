@@ -973,6 +973,10 @@ def test_courses_calendar_json_names_the_course_and_keeps_the_offset(
     assert quiz_event["due_at"] == epoch_to_datetime(1773954000).isoformat()  # type: ignore[union-attr]
     assert data[1]["overdue"] is True
     assert data[1]["actionable"] is False
+    site_event = next(e for e in data if e["id"] == 990119)
+    assert site_event["activity"] is None
+    assert site_event["instance_id"] is None
+    assert site_event["action"] is None
 
 
 @respx.mock
@@ -1081,6 +1085,19 @@ def test_auth_capabilities_does_not_claim_failure_on_an_empty_function_list() ->
 
     assert result.exit_code == 0
     assert "did not report a function list" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_json_treats_an_empty_function_list_as_unknown() -> None:
+    route_by_function(core_webservice_get_site_info={"userid": 1, "functions": []})
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["functions_available"] == 0
+    assert data["features"] == []
+    assert data["components"] == []
 
 
 @respx.mock

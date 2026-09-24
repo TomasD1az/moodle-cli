@@ -113,7 +113,7 @@ FEATURES: tuple[Feature, ...] = (
     Feature(
         "updates",
         "course updates",
-        ("core_course_check_updates", "core_course_get_updates_since"),
+        ("core_course_get_updates_since",),
         "Ask what changed in a course since a given moment.",
     ),
     Feature(

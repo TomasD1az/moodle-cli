@@ -258,6 +258,29 @@ def auth_capabilities(
         info = client.get_site_info()
 
     available = info.function_names
+    if not available:
+        # A campus can answer get_site_info without a function list. Reporting that as
+        # "nothing works" would be a confident wrong answer; every command below might
+        # still succeed.
+        if as_json:
+            _emit_json(
+                {
+                    "site": info.sitename,
+                    "release": info.release,
+                    "functions_available": 0,
+                    "file_downloads_allowed": info.downloadfiles,
+                    "features": [],
+                    "components": [],
+                    "functions": sorted(available) if all_functions else None,
+                }
+            )
+        else:
+            err_console.print(
+                "[yellow]This campus did not report a function list, so nothing can be "
+                "checked against it.[/yellow]"
+            )
+        return
+
     statuses = evaluate(available)
 
     if as_json:
@@ -284,16 +307,6 @@ def auth_capabilities(
                 ],
                 "functions": sorted(available) if all_functions else None,
             }
-        )
-        return
-
-    if not available:
-        # A campus can answer get_site_info without a function list. Reporting that as
-        # "nothing works" would be a confident wrong answer; every command below might
-        # still succeed.
-        err_console.print(
-            "[yellow]This campus did not report a function list, so nothing can be "
-            "checked against it.[/yellow]"
         )
         return
 
@@ -478,13 +491,13 @@ def _event_payload(event: CalendarEvent, course: str) -> dict[str, Any]:
         "id": event.id,
         "name": event.name,
         "course": course,
-        "activity": event.modulename,
-        "instance_id": event.instance,
+        "activity": event.modulename or None,
+        "instance_id": event.instance or None,
         "due_at": event.sorts_at.isoformat() if event.sorts_at else None,
         "overdue": event.overdue,
-        "action": event.action_name,
+        "action": event.action_name or None,
         "actionable": event.actionable,
-        "url": event.url or event.viewurl,
+        "url": event.url or event.viewurl or None,
     }
 
 

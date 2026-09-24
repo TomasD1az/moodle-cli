@@ -686,6 +686,11 @@ def test_get_calendar_events_pages_until_a_short_page(
     same at two per page as at fifty.
     """
     monkeypatch.setattr("moodle_cli.client._CALENDAR_PAGE_SIZE", 2)
+    tick = [1_700_000_000]
+    monkeypatch.setattr(
+        "moodle_cli.client.time.time",
+        lambda: tick.__setitem__(0, tick[0] + 1) or tick[0],
+    )
     first = {"events": calendar_payload["events"][:2], "lastid": 990118}
     second = {"events": calendar_payload["events"][2:], "lastid": 990119}
     route = respx.post(REST_URL).mock(
@@ -698,6 +703,9 @@ def test_get_calendar_events_pages_until_a_short_page(
     assert len(route.calls) == 2
     assert "aftereventid" not in posted_params(route.calls[0].request)
     assert posted_params(route.calls[1].request)["aftereventid"] == "990118"
+    assert posted_params(route.calls[0].request)["timesortfrom"] == posted_params(
+        route.calls[1].request
+    )["timesortfrom"]
 
 
 @respx.mock

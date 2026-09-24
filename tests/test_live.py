@@ -208,12 +208,14 @@ def test_calendar_by_course_is_a_subset_of_the_campus_sweep(live_client: MoodleC
 def test_course_updates_answers_for_every_course(live_client: MoodleClient) -> None:
     """core_course_get_updates_since must stay exposed and answer without warnings."""
     now = int(time.time())
+    checked = False
     for course in live_client.list_courses(view="all"):
         updates = live_client.get_course_updates(course.id, since=now - 90 * 86_400)
         assert all(u.id > 0 for u in updates)
         assert all(u.updates for u in updates), "an unchanged activity must be dropped"
-        return
-    pytest.skip("no enrolled courses")
+        checked = True
+    if not checked:
+        pytest.skip("no enrolled courses")
 
 
 def test_quiz_review_reads_back_a_finished_attempt(live_client: MoodleClient) -> None:

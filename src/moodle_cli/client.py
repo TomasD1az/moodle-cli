@@ -440,10 +440,11 @@ class MoodleClient:
         )
         events: list[CalendarEvent] = []
         after_event_id = 0
+        timesort_from = int(time.time()) if since is None else since
         while len(events) < limit:
             page_size = min(_CALENDAR_PAGE_SIZE, limit - len(events))
             params: dict[str, Any] = {
-                "timesortfrom": int(time.time()) if since is None else since,
+                "timesortfrom": timesort_from,
                 "limitnum": page_size,
             }
             if until is not None:
