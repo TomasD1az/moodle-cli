@@ -20,6 +20,7 @@ from rich.table import Table
 
 from moodle_cli import __version__ as __version__
 from moodle_cli.auth import TokenStore, mint_token
+from moodle_cli.capabilities import State, evaluate, group_by_component
 from moodle_cli.client import MoodleClient
 from moodle_cli.config import load_config
 from moodle_cli.downloads import (
@@ -232,6 +233,97 @@ def auth_status() -> None:
     console.print(f"  site: {info.sitename}")
     console.print(f"  functions available: {len(info.function_names)}")
     console.print(f"  file downloads allowed: {info.downloadfiles}")
+
+
+@auth_app.command("capabilities")
+@handle_errors
+def auth_capabilities(
+    all_functions: Annotated[
+        bool,
+        typer.Option("--functions", help="List every function name instead of a per-feature view."),
+    ] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show what this campus lets this token do.
+
+    Campuses enable different slices of Moodle's web-service API, so a command failing
+    here is as likely to be a campus setting as a bug. This answers which ones will work
+    before you run them, and names the functions a missing one needs — which is what you
+    would ask a Moodle administrator to enable.
+
+    Features listed with no command are ones this campus supports and this tool does not
+    implement yet.
+    """
+    with open_client(allow_mint=False) as client:
+        info = client.get_site_info()
+
+    available = info.function_names
+    statuses = evaluate(available)
+
+    if as_json:
+        _emit_json(
+            {
+                "site": info.sitename,
+                "release": info.release,
+                "functions_available": len(available),
+                "file_downloads_allowed": info.downloadfiles,
+                "features": [
+                    {
+                        "name": s.feature.name,
+                        "state": s.state.value,
+                        "commands": s.feature.commands,
+                        "built": s.feature.built,
+                        "summary": s.feature.summary,
+                        "missing": list(s.missing),
+                    }
+                    for s in statuses
+                ],
+                "components": [
+                    {"component": name, "functions": count}
+                    for name, count in group_by_component(available)
+                ],
+                "functions": sorted(available) if all_functions else None,
+            }
+        )
+        return
+
+    if not available:
+        # A campus can answer get_site_info without a function list. Reporting that as
+        # "nothing works" would be a confident wrong answer; every command below might
+        # still succeed.
+        err_console.print(
+            "[yellow]This campus did not report a function list, so nothing can be "
+            "checked against it.[/yellow]"
+        )
+        return
+
+    if all_functions:
+        for name in sorted(available):
+            console.print(name)
+        console.print(f"\n{len(available)} functions available to this token")
+        return
+
+    table = Table(title=f"{info.sitename or 'Campus'} — {len(available)} functions available")
+    table.add_column("feature", no_wrap=True)
+    table.add_column("", justify="center", no_wrap=True)
+    table.add_column("command", no_wrap=True, style="dim")
+    table.add_column("needs", ratio=1, overflow="fold", style="dim")
+    for status in statuses:
+        mark = {State.OK: "[green]yes[/green]", State.PARTIAL: "[yellow]part[/yellow]"}.get(
+            status.state, "[red]no[/red]"
+        )
+        if status.feature.commands:
+            where = status.feature.commands
+        else:
+            where = "-- not built yet --" if not status.feature.built else "(automatic)"
+        table.add_row(
+            escape(status.feature.name),
+            mark,
+            escape(where),
+            escape(", ".join(status.missing)),
+        )
+    console.print(table)
+    console.print(f"file downloads allowed: {info.downloadfiles}")
 
 
 @auth_app.command("logout")

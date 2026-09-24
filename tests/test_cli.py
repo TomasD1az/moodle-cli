@@ -1021,6 +1021,109 @@ def test_course_calendar_rejects_a_zero_day_window(courses_payload: dict[str, An
     assert result.exit_code == 2
 
 
+# -- capabilities ----------------------------------------------------------------
+
+
+@respx.mock
+def test_auth_capabilities_marks_features_the_campus_supports() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "sitename": "Example University",
+            "userid": 1,
+            "downloadfiles": True,
+            "functions": [
+                {"name": "core_course_get_enrolled_courses_by_timeline_classification"},
+                {"name": "core_course_get_contents"},
+                {"name": "mod_quiz_get_quizzes_by_courses"},
+            ],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities"])
+
+    assert result.exit_code == 0
+    assert "courses" in result.output
+    assert "quizzes" in result.output
+    assert "Example University" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_json_names_what_is_missing() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "sitename": "Example University",
+            "userid": 1,
+            "functions": [
+                {"name": "core_course_get_contents"},
+                {"name": "mod_quiz_get_quizzes_by_courses"},
+            ],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    features = {f["name"]: f for f in data["features"]}
+    assert features["contents"]["state"] == "ok"
+    assert features["quizzes"]["state"] == "partial"
+    assert "mod_quiz_get_user_attempts" in features["quizzes"]["missing"]
+    assert features["calendar"]["state"] == "unavailable"
+    assert data["functions_available"] == 2
+
+
+@respx.mock
+def test_auth_capabilities_does_not_claim_failure_on_an_empty_function_list() -> None:
+    """An empty list means the campus said nothing, not that nothing works."""
+    route_by_function(core_webservice_get_site_info={"userid": 1, "functions": []})
+
+    result = runner.invoke(app, ["auth", "capabilities"])
+
+    assert result.exit_code == 0
+    assert "did not report a function list" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_can_list_raw_function_names() -> None:
+    route_by_function(
+        core_webservice_get_site_info={
+            "userid": 1,
+            "functions": [{"name": "core_course_get_contents"}],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--functions"])
+
+    assert result.exit_code == 0
+    assert "core_course_get_contents" in result.output
+    assert "1 functions available" in result.output
+
+
+@respx.mock
+def test_auth_capabilities_distinguishes_automatic_features_from_unbuilt_ones() -> None:
+    """A feature with no command is not necessarily missing work."""
+    route_by_function(
+        core_webservice_get_site_info={
+            "userid": 1,
+            "functions": [{"name": "tool_mobile_call_external_functions"}],
+        }
+    )
+
+    result = runner.invoke(app, ["auth", "capabilities", "--json"])
+
+    assert result.exit_code == 0
+    features = {f["name"]: f for f in json.loads(result.stdout)["features"]}
+    assert features["batching"] == {
+        "name": "batching",
+        "state": "ok",
+        "commands": "",
+        "built": True,
+        "summary": "Several calls in one request, used automatically where it helps.",
+        "missing": [],
+    }
+    assert features["quiz attempts"]["built"] is False
+
+
 # -- downloading every course ----------------------------------------------------
 
 

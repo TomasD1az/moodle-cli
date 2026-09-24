@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from moodle_cli.capabilities import evaluate
 from moodle_cli.client import MoodleClient
 from moodle_cli.downloads import download_file, plan_downloads
 from moodle_cli.errors import MoodleAPIError
@@ -233,3 +234,33 @@ def test_quiz_review_reads_back_a_finished_attempt(live_client: MoodleClient) ->
         assert all(q.mark_value is not None for q in review.questions if q.mark)
         return
     pytest.skip("no attempted quiz to review")
+
+
+def test_the_capability_table_matches_what_the_campus_reports(live_client: MoodleClient) -> None:
+    """Every feature with a command must be one this campus can actually run.
+
+    This is the assertion that fails when a campus turns a function off, which is the
+    thing `auth capabilities` exists to tell a user about — so it should fail loudly here
+    rather than only in their terminal.
+    """
+    available = live_client.get_site_info().function_names
+    assert available, "the campus reported no function list"
+
+    unavailable = [s.feature.name for s in evaluate(available) if s.feature.commands and s.missing]
+    assert not unavailable, f"commands exist for features this campus lacks: {unavailable}"
+
+
+def test_batching_agrees_with_calling_one_at_a_time(live_client: MoodleClient) -> None:
+    """A batched answer must be indistinguishable from the same calls sent separately."""
+    if not live_client.supports_batching:
+        pytest.skip("this campus does not expose tool_mobile_call_external_functions")
+
+    courses = live_client.list_courses(view="all")[:2]
+    if len(courses) < 2:
+        pytest.skip("need two courses to compare a batch against separate calls")
+
+    calls = [("core_course_get_contents", {"courseid": c.id}) for c in courses]
+    batched = live_client.call_many(calls)
+    separately = [live_client.call(function, **params) for function, params in calls]
+
+    assert batched == separately

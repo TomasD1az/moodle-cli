@@ -12,6 +12,7 @@ Works with any Moodle instance that has web services and the mobile service enab
 - [MCP server](#mcp-server)
 - [Plugins](#plugins)
 - [Command reference](#command-reference)
+- [What your campus supports](#what-your-campus-supports)
 - [Configuration](#configuration)
 - [Exit codes](#exit-codes)
 - [Things worth knowing](#things-worth-knowing)
@@ -108,6 +109,7 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | --- | --- |
 | `moodle auth login` | Mint a token and store it in the keyring. |
 | `moodle auth status` | Show who the stored token belongs to, and what it can do. |
+| `moodle auth capabilities` | Show which features this campus exposes to this token. |
 | `moodle auth logout` | Delete the stored token. |
 
 ### [Updating](docs/updating.md)
@@ -188,6 +190,20 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | `moodle courses grades` | `get_grade_summary` | Show a grade summary across every enrolled course. |
 | `moodle course grades` | `get_grades` | Show the per-item grade breakdown for one course. |
 
+## What your campus supports
+
+Campuses enable different slices of Moodle's web-service API, so a command failing is as
+likely to be a campus setting as a bug:
+
+```bash
+moodle auth capabilities
+```
+
+That lists which features your token can actually reach and names the web-service
+functions a missing one would need — which is what you would ask a Moodle administrator
+to enable. Features shown with no command are ones your campus supports and this tool does
+not implement yet. See [docs/capabilities.md](docs/capabilities.md).
+
 ## Configuration
 
 | Variable | Required | Purpose |
@@ -242,6 +258,7 @@ number of requests grows with the size of an enrolment — one per course's news
 instance — they go out together through `tool_mobile_call_external_functions`, which is
 the endpoint the official mobile app uses for the same reason. A campus that does not
 expose it gets one request each instead, and nothing else about the answer changes.
+`moodle auth capabilities` reports which of the two your campus is.
 
 **Course lists are read once per command, not once per question.** A single command often
 needs the enrolment twice — to turn a shortname into an id, and to label rows that carry
