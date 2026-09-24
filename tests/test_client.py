@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -666,3 +667,187 @@ def test_site_info_is_fetched_once(client: MoodleClient) -> None:
     client.get_site_info()
 
     assert len(route.calls) == 1
+
+
+# -- batching --------------------------------------------------------------------
+
+
+@respx.mock
+def test_call_many_sends_one_request_when_the_campus_supports_it(
+    client: MoodleClient,
+) -> None:
+    """The mobile app's multi-call endpoint is what avoids a round trip per activity."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps({"discussions": [{"id": 1}]})},
+                    {"error": False, "data": json.dumps({"discussions": [{"id": 2}]})},
+                ]
+            },
+        )
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    results = client.call_many(
+        [
+            ("mod_forum_get_forum_discussions", {"forumid": 501}),
+            ("mod_forum_get_forum_discussions", {"forumid": 502}),
+        ]
+    )
+
+    assert results == [{"discussions": [{"id": 1}]}, {"discussions": [{"id": 2}]}]
+    batched = [
+        call
+        for call in route.calls
+        if "tool_mobile_call_external_functions" in call.request.content.decode()
+    ]
+    assert len(batched) == 1
+    params = posted_params(batched[0].request)
+    assert json.loads(params["requests[0][arguments]"]) == {"forumid": 501}
+
+
+@respx.mock
+def test_call_many_falls_back_to_one_request_each(client: MoodleClient) -> None:
+    """A campus without the endpoint must still get an answer, not an error."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(200, json={"userid": 1, "functions": []})
+        return httpx.Response(200, json={"discussions": []})
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    results = client.call_many(
+        [
+            ("mod_forum_get_forum_discussions", {"forumid": 501}),
+            ("mod_forum_get_forum_discussions", {"forumid": 502}),
+        ]
+    )
+
+    assert results == [{"discussions": []}, {"discussions": []}]
+    forum_calls = [
+        c for c in route.calls if "mod_forum_get_forum_discussions" in c.request.content.decode()
+    ]
+    assert len(forum_calls) == 2
+
+
+@respx.mock
+def test_call_many_skips_the_capability_check_for_a_single_call(client: MoodleClient) -> None:
+    """One call is never worth a batch, so it must not cost a site-info lookup."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json={"discussions": []}))
+
+    client.call_many([("mod_forum_get_forum_discussions", {"forumid": 501})])
+
+    assert len(route.calls) == 1
+
+
+@respx.mock
+def test_call_many_raises_the_error_one_batched_call_reported(client: MoodleClient) -> None:
+    """A failure inside a batch must raise the way it would have raised on its own."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps({"discussions": []})},
+                    {
+                        "error": True,
+                        "exception": json.dumps(
+                            {"errorcode": "nopermissions", "message": "Denied"}
+                        ),
+                    },
+                ]
+            },
+        )
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    with pytest.raises(MoodleAPIError) as caught:
+        client.call_many(
+            [
+                ("mod_forum_get_forum_discussions", {"forumid": 501}),
+                ("mod_forum_get_forum_discussions", {"forumid": 502}),
+            ]
+        )
+
+    assert caught.value.errorcode == "nopermissions"
+
+
+@respx.mock
+def test_call_many_rejects_a_short_answer(client: MoodleClient) -> None:
+    """Fewer responses than calls would silently pair results with the wrong request."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        return httpx.Response(200, json={"responses": [{"error": False, "data": "{}"}]})
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    with pytest.raises(MoodleError):
+        client.call_many([("a", {}), ("b", {})])
+
+
+@respx.mock
+def test_get_announcements_batches_one_call_per_news_forum(
+    client: MoodleClient,
+    courses_payload: dict[str, Any],
+    forums_payload: list[dict[str, Any]],
+    discussions_payload: dict[str, Any],
+) -> None:
+    """Announcements cost one call per course; over an enrolment that is the round trips."""
+    second_news_forum = {**forums_payload[0], "id": 503, "course": 102}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_webservice_get_site_info" in body:
+            return httpx.Response(
+                200,
+                json={"userid": 1, "functions": [{"name": "tool_mobile_call_external_functions"}]},
+            )
+        if "core_course_get_enrolled_courses" in body:
+            return httpx.Response(200, json=courses_payload)
+        if "mod_forum_get_forums_by_courses" in body:
+            return httpx.Response(200, json=[*forums_payload, second_news_forum])
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"error": False, "data": json.dumps(discussions_payload)},
+                    {"error": False, "data": json.dumps({"discussions": [], "warnings": []})},
+                ]
+            },
+        )
+
+    route = respx.post(REST_URL).mock(side_effect=responder)
+
+    announcements = client.get_announcements()
+
+    assert announcements
+    per_forum = [
+        call
+        for call in route.calls
+        if "wsfunction=mod_forum_get_forum_discussions" in call.request.content.decode()
+    ]
+    assert per_forum == []  # they went inside the batch instead

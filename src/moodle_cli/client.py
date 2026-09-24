@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Any
@@ -26,6 +27,10 @@ from moodle_cli.models import (
 )
 
 REST_PATH = "/webservice/rest/server.php"
+
+#: The mobile app's multi-call endpoint. Not every campus exposes it, so every use of it
+#: goes through :meth:`MoodleClient.call_many`, which falls back to one request each.
+BATCH_FUNCTION = "tool_mobile_call_external_functions"
 
 #: Public filter name -> Moodle ``classification`` value, read off the dashboard dropdown.
 VIEWS: dict[str, str] = {
@@ -146,6 +151,50 @@ class MoodleClient:
         """
         return self._call(function, **params)
 
+    @property
+    def supports_batching(self) -> bool:
+        """Whether this campus exposes the mobile app's multi-call endpoint.
+
+        Reading it costs nothing extra in practice: ``get_site_info`` is cached, and any
+        command large enough to want batching makes more than one call anyway.
+        """
+        return BATCH_FUNCTION in self.get_site_info().function_names
+
+    def call_many(self, calls: Sequence[tuple[str, dict[str, Any]]]) -> list[Any]:
+        """Run several calls in one HTTP request, falling back to one request each.
+
+        ``tool_mobile_call_external_functions`` is what the official mobile app uses to
+        avoid a round trip per activity. It is worth reaching for wherever the number of
+        calls grows with the size of a course or an enrolment — a campus-wide sweep over
+        sequential requests is dominated by latency, not by work.
+
+        Results come back in the order asked. A single call that failed raises, exactly as
+        it would have on its own: batching is a transport detail, and a caller must not
+        have to check for errors differently depending on how its request was carried.
+
+        Not every campus exposes the endpoint, and the fallback is a plain loop, so a
+        caller never has to ask whether it is available.
+        """
+        if len(calls) <= 1 or not self.supports_batching:
+            return [self._call(function, **params) for function, params in calls]
+
+        body = self._call(
+            BATCH_FUNCTION,
+            requests=[
+                # Arguments travel as a JSON string here, not as Moodle's usual bracketed
+                # form encoding: the batch endpoint decodes each one itself.
+                {"function": function, "arguments": json.dumps(params)}
+                for function, params in calls
+            ],
+        )
+        responses = body.get("responses") or []
+        if len(responses) != len(calls):
+            raise MoodleError(f"{BATCH_FUNCTION} answered {len(responses)} of {len(calls)} calls")
+        return [
+            _unwrap_batched(response, function)
+            for response, (function, _) in zip(responses, calls, strict=True)
+        ]
+
     # -- endpoints ---------------------------------------------------------------
 
     def get_site_info(self) -> SiteInfo:
@@ -226,11 +275,16 @@ class MoodleClient:
             return []
 
         body = self._call("mod_forum_get_forums_by_courses", courseids=ids)
-        forums = [Forum.model_validate(f) for f in body]
+        forums = [f for f in (Forum.model_validate(f) for f in body) if f.type == "news"]
+
+        # One call per news forum, which is one per course: over a full enrolment that is
+        # where the time goes, and it is exactly the shape the batch endpoint exists for.
+        bodies = self.call_many(
+            [("mod_forum_get_forum_discussions", {"forumid": forum.id}) for forum in forums]
+        )
 
         announcements: list[Announcement] = []
-        for forum in (f for f in forums if f.type == "news"):
-            discussions = self._call("mod_forum_get_forum_discussions", forumid=forum.id)
+        for forum, discussions in zip(forums, bodies, strict=True):
             check_warnings(discussions, function="mod_forum_get_forum_discussions")
             for discussion in discussions.get("discussions") or []:
                 announcements.append(
@@ -383,6 +437,38 @@ class MoodleClient:
             raise MoodleError(f"No enrolled course matching {reference!r}")
         names = ", ".join(sorted(c.shortname for c in matches))
         raise MoodleError(f"{reference!r} is ambiguous; matches: {names}")
+
+
+def _unwrap_batched(response: dict[str, Any], function: str) -> Any:
+    """One entry of a batched answer, raised or decoded as if it had been sent alone.
+
+    The batch endpoint answers 200 for the request as a whole and reports each call's
+    outcome inside it, with both the data and the exception JSON-encoded as strings. An
+    unread ``error`` flag here is the same failure mode as an unread error body on a
+    single call: a failure that reaches the caller wearing the shape of data.
+    """
+    if response.get("error"):
+        raw = response.get("exception") or "{}"
+        try:
+            detail = json.loads(raw)
+        except ValueError:
+            detail = {}
+        raise MoodleAPIError(
+            errorcode=str(detail.get("errorcode", "unknown")),
+            message=str(detail.get("message") or "Request failed"),
+            function=function,
+        )
+    data = response.get("data")
+    if data is None:
+        return None
+    try:
+        decoded = json.loads(data)
+    except ValueError as exc:
+        raise MoodleError(f"{function} returned a non-JSON response in a batch") from exc
+    # A batched call can still answer with an ordinary error payload rather than by
+    # setting the error flag, so it goes through the same check as an unbatched one.
+    check_api_error(decoded, function=function)
+    return decoded
 
 
 def check_api_error(body: Any, *, function: str | None = None) -> None:

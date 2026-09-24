@@ -221,6 +221,12 @@ next morning in Rome. Every MCP timestamp therefore carries its offset, `due_at`
 `closes_at` included. The CLI tables still print a date, which is the right granularity to
 read at a glance and the wrong one to compute a deadline from.
 
+**Repeated calls in one command are batched where the campus allows it.** Where the
+number of requests grows with the size of an enrolment — one per course's news forum, for
+instance — they go out together through `tool_mobile_call_external_functions`, which is
+the endpoint the official mobile app uses for the same reason. A campus that does not
+expose it gets one request each instead, and nothing else about the answer changes.
+
 **Course lists are read once per command, not once per question.** A single command often
 needs the enrolment twice — to turn a shortname into an id, and to label rows that carry
 only an id. That is cached for the life of one command and never written to disk, so a
