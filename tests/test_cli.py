@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from typing import Any
@@ -863,6 +864,7 @@ CORE_COMMANDS_WITHOUT_JSON = {
     ("auth", "status"),
     ("auth", "logout"),
     ("course", "download"),
+    ("courses", "download"),
 }
 
 CORE_GROUPS = ("auth", "courses", "course", "plugins")
@@ -1015,6 +1017,103 @@ def test_course_calendar_rejects_a_zero_day_window(courses_payload: dict[str, An
     route_by_function(core_course_get_enrolled_courses_by_timeline_classification=courses_payload)
 
     result = runner.invoke(app, ["course", "calendar", "IOS460", "--days", "0"])
+
+    assert result.exit_code == 2
+
+
+# -- downloading every course ----------------------------------------------------
+
+
+@respx.mock
+def test_courses_download_makes_one_directory_per_course(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    """Every enrolled course is swept, each into a subdirectory of its own."""
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+    respx.get(url__startswith=f"{BASE_URL}/webservice/pluginfile.php").mock(
+        side_effect=lambda request: httpx.Response(200, content=b"x" * _expected_size(request))
+    )
+
+    result = runner.invoke(app, ["courses", "download", "--type", "resource"])
+
+    assert result.exit_code == 0
+    directories = sorted(p.name for p in tmp_cwd.iterdir() if p.is_dir())
+    assert directories == ["I310 - 106934", "I312 - 106931", "IOS460 - 123246"]
+    assert "across 3 courses" in result.stdout
+
+
+@respx.mock
+def test_courses_download_honours_an_output_parent(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "download", "-o", "campus", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "campus/IOS460 - 123246" in result.stdout.replace("\\", "/")
+    assert list(tmp_cwd.iterdir()) == []
+
+
+@respx.mock
+def test_courses_download_skips_a_course_it_cannot_read(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    """One unreadable course must not end a sweep of the whole enrolment."""
+    answers = itertools.chain(
+        [httpx.Response(200, json={"errorcode": "nopermissions", "message": "Denied"})],
+        itertools.repeat(httpx.Response(200, json=contents_payload)),
+    )
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "core_course_get_contents" in body:
+            return next(answers)
+        return httpx.Response(200, json=courses_payload)
+
+    respx.post(REST_URL).mock(side_effect=responder)
+
+    result = runner.invoke(app, ["courses", "download", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "skip" in result.output
+    assert "IOS460 - 123246" not in result.stdout
+    assert "I312 - 106931" in result.stdout
+
+
+@respx.mock
+def test_courses_download_reports_an_empty_sweep(
+    courses_payload: dict[str, Any],
+    contents_payload: list[dict[str, Any]],
+    tmp_cwd: Path,
+) -> None:
+    route_by_function(
+        core_course_get_enrolled_courses_by_timeline_classification=courses_payload,
+        core_course_get_contents=contents_payload,
+    )
+
+    result = runner.invoke(app, ["courses", "download", "--match", "*.nothing"])
+
+    assert result.exit_code == 0
+    assert "No matching files in any course" in result.stdout
+
+
+@pytest.mark.parametrize("flag", ["--file", "--section"])
+def test_courses_download_rejects_per_course_selectors(flag: str) -> None:
+    """A filename or a section number identifies something inside one course only."""
+    result = runner.invoke(app, ["courses", "download", flag, "1"])
 
     assert result.exit_code == 2
 

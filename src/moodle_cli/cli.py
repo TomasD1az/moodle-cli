@@ -7,6 +7,7 @@ import json
 import textwrap
 import time
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, ParamSpec, TypeVar
@@ -34,7 +35,7 @@ from moodle_cli.downloads import (
     plan_link_downloads,
     sanitize,
 )
-from moodle_cli.errors import MoodleError
+from moodle_cli.errors import MoodleAPIError, MoodleError
 from moodle_cli.models import (
     Announcement,
     Assignment,
@@ -485,6 +486,109 @@ def _short_name(fullname: str, shortname: str) -> str:
     return fullname
 
 
+@courses_app.command("download")
+@handle_errors
+def courses_download(
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Parent directory. Default: the current one."),
+    ] = None,
+    view: Annotated[View, typer.Option("--view", help="Which courses to include.")] = View.ALL,
+    types: Annotated[
+        list[str] | None,
+        typer.Option("--type", help="Only these module types, e.g. resource. Repeatable."),
+    ] = None,
+    patterns: Annotated[
+        list[str] | None,
+        typer.Option("--match", help="Glob on the filename, e.g. '*.pdf'. Repeatable."),
+    ] = None,
+    links: Annotated[
+        bool,
+        typer.Option(
+            "--links", help="Also fetch Google Slides/Docs/Sheets and Drive-hosted links."
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be downloaded, write nothing.")
+    ] = False,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Re-download files that already exist.")
+    ] = False,
+) -> None:
+    """Download every enrolled course's files into one directory per course.
+
+    The same download as `course download`, swept across your enrolment: each course
+    lands in its own subdirectory named after its shortname, mirroring its sections
+    inside. Re-running is as cheap as it is for one course, since a file already on disk
+    at the expected size is skipped.
+
+    --file and --section are not offered here on purpose: a filename or a section number
+    identifies something inside one course, and asking for it across every course would
+    either fail on the first course that lacks it or silently mean something different in
+    each. Use --type and --match, which describe files rather than positions.
+
+    A course that cannot be read is reported and skipped rather than ending the run; over
+    a whole enrolment, an archived or restricted course is ordinary rather than
+    exceptional.
+    """
+    selectors = _Selectors(
+        modtypes=set(types) if types else None,
+        patterns=patterns or None,
+    )
+    parent = output or Path()
+
+    plans: list[tuple[str, Path, list[PlannedDownload], list[PlannedLink]]] = []
+    with open_client() as client:
+        token = client.token
+        for found in client.list_courses(view=view.value):
+            root = parent / sanitize(found.shortname, fallback=str(found.id))
+            try:
+                contents = client.get_course_contents(found.id)
+            except MoodleAPIError as exc:
+                err_console.print(
+                    f"  [yellow]skip[/yellow] {escape(found.shortname)}: {escape(str(exc))}"
+                )
+                continue
+            planned, planned_links = _plan_course(contents, root, selectors, links=links)
+            if planned or planned_links:
+                plans.append((found.shortname, root, planned, planned_links))
+
+    if not plans:
+        console.print("[yellow]No matching files in any course.[/yellow]")
+        return
+
+    downloaded = skipped = attempted = 0
+    with httpx.Client(timeout=300, follow_redirects=True) as http:
+        for shortname, root, planned, planned_links in plans:
+            _print_course_header(shortname, root, planned, planned_links, links=links)
+            if dry_run:
+                _print_plan(planned, root)
+                if planned_links:
+                    _print_link_plan(planned_links, root)
+                continue
+            attempted += len(planned) + len(planned_links)
+            course_downloaded, course_skipped = _execute_plan(
+                http, token, root, planned, planned_links, overwrite=overwrite
+            )
+            downloaded += course_downloaded
+            skipped += course_skipped
+
+    if dry_run:
+        return
+
+    failed = attempted - downloaded - skipped
+    courses_done = len(plans)
+    summary = (
+        f"\n{downloaded} downloaded, {skipped} already present "
+        f"across {courses_done} {_plural(courses_done, 'course')}"
+    )
+    if failed:
+        summary += f", [red]{failed} failed[/red]"
+    console.print(summary)
+    if failed:
+        raise typer.Exit(1)
+
+
 @courses_app.command("search")
 @handle_errors
 def courses_search(
@@ -646,32 +750,19 @@ def course_download(
     zero-file download, so a typo fails loudly. --links only reaches Google-hosted links
     (Slides/Docs/Sheets exports, Drive files, Colab notebooks); other hosts stay listed-only.
     """
+    selectors = _Selectors(
+        sections=set(sections) if sections else None,
+        modtypes=set(types) if types else None,
+        names=set(names) if names else None,
+        patterns=patterns or None,
+    )
     with open_client() as client:
         token = client.token
         resolved = client.resolve_course(course)
         contents = client.get_course_contents(resolved.id)
 
     root = output or Path(sanitize(resolved.shortname, fallback=str(resolved.id)))
-    planned = plan_downloads(
-        contents,
-        root,
-        only_sections=set(sections) if sections else None,
-        only_modtypes=set(types) if types else None,
-        only_names=set(names) if names else None,
-        only_patterns=patterns or None,
-    )
-    planned_links = (
-        plan_link_downloads(
-            contents,
-            root,
-            only_sections=set(sections) if sections else None,
-            only_modtypes=set(types) if types else None,
-            only_names=set(names) if names else None,
-            only_patterns=patterns or None,
-        )
-        if links
-        else []
-    )
+    planned, planned_links = _plan_course(contents, root, selectors, links=links)
 
     if names:
         _reject_unknown_names(names, planned, planned_links, contents, links=links)
@@ -680,11 +771,7 @@ def course_download(
         console.print("[yellow]No matching files.[/yellow]")
         return
 
-    total = sum(p.file.filesize for p in planned)
-    summary_parts = [f"{len(planned)} {_plural(len(planned), 'file')}, {_human_size(total)}"]
-    if links:
-        summary_parts.append(f"{len(planned_links)} {_plural(len(planned_links), 'link')}")
-    console.print(f"[bold]{resolved.shortname}[/bold]: {', '.join(summary_parts)} -> {root}/")
+    _print_course_header(resolved.shortname, root, planned, planned_links, links=links)
 
     if dry_run:
         _print_plan(planned, root)
@@ -692,30 +779,111 @@ def course_download(
             _print_link_plan(planned_links, root)
         return
 
-    downloaded = skipped = 0
     with httpx.Client(timeout=300, follow_redirects=True) as http:
-        for item in planned:
-            fetch = functools.partial(
-                download_file, http, item.file, token, item.destination, overwrite=overwrite
-            )
-            downloaded, skipped = _run_download(root, item.destination, fetch, downloaded, skipped)
+        downloaded, skipped = _execute_plan(
+            http, token, root, planned, planned_links, overwrite=overwrite
+        )
 
-        for link_item in planned_links:
-            fetch = functools.partial(
-                download_link, http, link_item.link, link_item.destination, overwrite=overwrite
-            )
-            downloaded, skipped = _run_download(
-                root, link_item.destination, fetch, downloaded, skipped, label="[dim][link][/dim] "
-            )
-
-    total_planned = len(planned) + len(planned_links)
-    failed = total_planned - downloaded - skipped
+    failed = len(planned) + len(planned_links) - downloaded - skipped
     summary = f"\n{downloaded} downloaded, {skipped} already present"
     if failed:
         summary += f", [red]{failed} failed[/red]"
     console.print(summary)
     if failed:
         raise typer.Exit(1)
+
+
+@dataclass(frozen=True)
+class _Selectors:
+    """The four ways a download can be narrowed, carried as one value.
+
+    They travel together through planning and never apart: passing them as four
+    parameters made every caller restate the same `set(x) if x else None` conversion,
+    which is exactly where a single-course and an all-courses path would drift.
+    """
+
+    sections: set[int] | None = None
+    modtypes: set[str] | None = None
+    names: set[str] | None = None
+    patterns: list[str] | None = None
+
+
+def _plan_course(
+    contents: list[Section],
+    root: Path,
+    selectors: _Selectors,
+    *,
+    links: bool,
+) -> tuple[list[PlannedDownload], list[PlannedLink]]:
+    """What one course's download would fetch, files and Google-hosted links alike."""
+    planned = plan_downloads(
+        contents,
+        root,
+        only_sections=selectors.sections,
+        only_modtypes=selectors.modtypes,
+        only_names=selectors.names,
+        only_patterns=selectors.patterns,
+    )
+    planned_links = (
+        plan_link_downloads(
+            contents,
+            root,
+            only_sections=selectors.sections,
+            only_modtypes=selectors.modtypes,
+            only_names=selectors.names,
+            only_patterns=selectors.patterns,
+        )
+        if links
+        else []
+    )
+    return planned, planned_links
+
+
+def _print_course_header(
+    shortname: str,
+    root: Path,
+    planned: list[PlannedDownload],
+    planned_links: list[PlannedLink],
+    *,
+    links: bool,
+) -> None:
+    total = sum(p.file.filesize for p in planned)
+    parts = [f"{len(planned)} {_plural(len(planned), 'file')}, {_human_size(total)}"]
+    if links:
+        parts.append(f"{len(planned_links)} {_plural(len(planned_links), 'link')}")
+    console.print(f"[bold]{escape(shortname)}[/bold]: {', '.join(parts)} -> {root}/")
+
+
+def _execute_plan(
+    http: httpx.Client,
+    token: str,
+    root: Path,
+    planned: list[PlannedDownload],
+    planned_links: list[PlannedLink],
+    *,
+    overwrite: bool,
+) -> tuple[int, int]:
+    """Fetch a planned course, returning (downloaded, already present).
+
+    Failures are reported as they happen and counted by difference rather than returned:
+    a caller needs the total to decide its exit code, and one course failing must not
+    stop the next one in an all-courses run.
+    """
+    downloaded = skipped = 0
+    for item in planned:
+        fetch = functools.partial(
+            download_file, http, item.file, token, item.destination, overwrite=overwrite
+        )
+        downloaded, skipped = _run_download(root, item.destination, fetch, downloaded, skipped)
+
+    for link_item in planned_links:
+        fetch = functools.partial(
+            download_link, http, link_item.link, link_item.destination, overwrite=overwrite
+        )
+        downloaded, skipped = _run_download(
+            root, link_item.destination, fetch, downloaded, skipped, label="[dim][link][/dim] "
+        )
+    return downloaded, skipped
 
 
 def _run_download(

@@ -94,7 +94,8 @@ taken as fatal. See [docs/plugins.md](docs/plugins.md).
 
 Every command that answers a question accepts `--json`, which prints machine-readable
 output instead of a table. The ones that act rather than answer do not: `auth login`,
-`auth status`, `auth logout` and `course download` report progress as they go.
+`auth status`, `auth logout`, `course download` and `courses download` report progress as
+they go.
 Commands that take a course accept either its numeric id or a shortname prefix; a
 prefix matching more than one course is an error listing the candidates.
 
@@ -137,6 +138,7 @@ notes. An installed plugin adds a group of its own; `moodle plugins list` shows 
 | CLI | MCP tool | Description |
 | --- | --- | --- |
 | `moodle course download` | `download_course_files` | Download a course's files, narrowed by section, type, name or glob. |
+| `moodle courses download` | — | Download every enrolled course into one directory per course. |
 
 ### [Participants](docs/participants.md)
 
