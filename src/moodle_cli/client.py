@@ -96,6 +96,12 @@ class MoodleClient:
         self.token = token
         self._owns_client = client is None
         self._http = client or httpx.Client(timeout=timeout, follow_redirects=True)
+        # Keyed by (view, sort), because those are what change the answer. Scoped to this
+        # client and never written to disk: one command's lifetime is short enough that a
+        # course list cannot go stale within it, which is the property that makes caching
+        # here safe and caching across invocations a correctness question instead.
+        self._course_cache: dict[tuple[str, str], list[Course]] = {}
+        self._site_info: SiteInfo | None = None
 
     def __enter__(self) -> MoodleClient:
         return self
@@ -143,15 +149,30 @@ class MoodleClient:
     # -- endpoints ---------------------------------------------------------------
 
     def get_site_info(self) -> SiteInfo:
-        return SiteInfo.model_validate(self._call("core_webservice_get_site_info"))
+        """Who the token belongs to, and what the campus exposes to it.
+
+        Cached for the life of the client: three separate commands read it to learn the
+        user id alone, and it does not change mid-command.
+        """
+        if self._site_info is None:
+            self._site_info = SiteInfo.model_validate(self._call("core_webservice_get_site_info"))
+        return self._site_info
 
     def list_courses(self, view: str = "all", sort: str = "name") -> list[Course]:
         """List enrolled courses.
 
         ``view`` and ``sort`` take the public names in :data:`VIEWS` and :data:`SORTS`.
+
+        The answer is cached per (view, sort) on this client. A single command routinely
+        asks twice — once through :meth:`resolve_course` to turn a shortname into an id,
+        once to label rows that carry only an id — and reading one quiz's maximum used to
+        re-list every course per quiz.
         """
         classification = _lookup(VIEWS, view, "view")
         sort_value = _lookup(SORTS, sort, "sort")
+        cached = self._course_cache.get((classification, sort_value))
+        if cached is not None:
+            return cached
         body = self._call(
             "core_course_get_enrolled_courses_by_timeline_classification",
             classification=classification,
@@ -159,7 +180,9 @@ class MoodleClient:
             offset=0,
             sort=sort_value,
         )
-        return [Course.model_validate(c) for c in body.get("courses", [])]
+        courses = [Course.model_validate(c) for c in body.get("courses", [])]
+        self._course_cache[(classification, sort_value)] = courses
+        return courses
 
     def get_course_contents(self, course_id: int) -> list[Section]:
         body = self._call("core_course_get_contents", courseid=course_id)

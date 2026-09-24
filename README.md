@@ -221,6 +221,11 @@ next morning in Rome. Every MCP timestamp therefore carries its offset, `due_at`
 `closes_at` included. The CLI tables still print a date, which is the right granularity to
 read at a glance and the wrong one to compute a deadline from.
 
+**Course lists are read once per command, not once per question.** A single command often
+needs the enrolment twice — to turn a shortname into an id, and to label rows that carry
+only an id. That is cached for the life of one command and never written to disk, so a
+course you enrol in shows up on the very next run.
+
 **A broken plugin is skipped, not fatal.** A plugin that fails to import, targets a
 different contract version, or claims a command name this tool owns is left out with a
 warning while everything else keeps working. Set `MOODLE_NO_PLUGINS=1` to skip discovery

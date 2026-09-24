@@ -623,3 +623,46 @@ def test_resolve_course_reports_unknown_reference(resolving_client: MoodleClient
 def test_resolve_course_reports_unknown_id(resolving_client: MoodleClient) -> None:
     with pytest.raises(MoodleError, match="id 4242"):
         resolving_client.resolve_course("4242")
+
+
+# -- caching ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_list_courses_is_fetched_once_per_view_and_sort(
+    client: MoodleClient, courses_payload: dict[str, Any]
+) -> None:
+    """The repeat that a single command makes costs one request, not two."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=courses_payload))
+
+    client.list_courses(view="all")
+    client.list_courses(view="all")
+    client.resolve_course("IOS460")
+
+    assert len(route.calls) == 2  # "all" once, plus all-including-hidden for resolution
+
+
+@respx.mock
+def test_list_courses_caches_each_view_separately(
+    client: MoodleClient, courses_payload: dict[str, Any]
+) -> None:
+    """A cache keyed on nothing would answer `starred` with the `all` list."""
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json=courses_payload))
+
+    client.list_courses(view="all")
+    client.list_courses(view="starred")
+
+    assert len(route.calls) == 2
+    assert posted_params(route.calls[1].request)["classification"] == "favourites"
+
+
+@respx.mock
+def test_site_info_is_fetched_once(client: MoodleClient) -> None:
+    route = respx.post(REST_URL).mock(
+        return_value=httpx.Response(200, json={"userid": 1, "functions": []})
+    )
+
+    client.get_site_info()
+    client.get_site_info()
+
+    assert len(route.calls) == 1
